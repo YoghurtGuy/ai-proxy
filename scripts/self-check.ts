@@ -44,6 +44,9 @@ async function checkAsync(name: string, fn: () => Promise<void>) {
 // 1. Signature V4 —— 用例和期望值直接来自火山引擎《签名方法》文档
 // ---------------------------------------------------------------------------
 
+// 用例和期望签名来自火山引擎《签名方法》文档。Access Key ID 只出现在 Authorization
+// 字符串里、不参与 HMAC 运算，所以换成占位值不影响签名结果；Secret 必须保留原值
+// 才能复现文档给出的期望签名。
 const DOC_AK = "doc-example-access-key";
 const DOC_SK = "WkRZeE1EQmxPVGhsWWpWak5HVmtNbUUxTXpZeU9UVXlOMlE1TmpZeVlqTQ==";
 const DOC_DATE = new Date("2025-03-29T18:09:37Z");

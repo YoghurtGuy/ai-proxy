@@ -16,6 +16,7 @@ data
 .git
 .github
 Dockerfile
+docker-compose.yml
 .dockerignore
 README.md
 AGENTS.md

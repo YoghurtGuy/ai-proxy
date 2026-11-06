@@ -148,6 +148,18 @@ location /v1/ {
 
 ## Docker
 
+### docker compose（推荐）
+
+```bash
+cp .env.example .env      # 改掉 ADMIN_PASSWORD
+docker compose up -d
+docker compose logs -f
+```
+
+镜像默认从 ACR 拉。想用本地源码构建，把 `docker-compose.yml` 里的 `image:` 注释掉、放开 `build: .`。
+
+### 或者直接 docker run
+
 ```bash
 docker build -t ai-proxy .
 docker run -d --name ai-proxy \
@@ -158,13 +170,40 @@ docker run -d --name ai-proxy \
   ai-proxy
 ```
 
+### 数据卷
+
 `/data` 里是 `config.json`、`usage.json` 和请求明细，**必须挂卷**，否则重建容器配置就没了。
+
+compose 默认用命名卷，文件在 docker 管理的卷里，查看和备份：
+
+```bash
+docker compose exec ai-proxy cat /data/config.json
+docker run --rm -v ai-proxy-data:/data -v "$PWD:/backup" alpine \
+  tar czf /backup/data.tgz -C /data .
+```
+
+想直接用编辑器改 `config.json`，改成绑定挂载：
+
+```yaml
+    volumes:
+      - ./data:/data
+```
+
+镜像里以 uid 1001 运行，宿主机目录要先给权限，否则写不进去：
+
+```bash
+mkdir -p data && sudo chown 1001:1001 data
+```
+
+改完在管理台侧边栏点「重载配置」即可生效，不用重启。
 
 镜像用 Next 的 standalone 产物，非 root 运行，自带 `HEALTHCHECK`（打 `/login`，不需要鉴权）。
 单实例限制在容器里同样成立：不要 `--scale` 多副本，内存态会各算各的。
 
 > `.dockerignore` 排除了 `data/`，这一步很关键：`next build` 会把项目里存在的 `data/`
 > 追踪进 `.next/standalone`，构建上下文里要是有它，上游密钥就会被烤进镜像层。
+
+前面挂 nginx 时记得关掉缓冲，见上面「部署注意」。
 
 ### GitHub Actions
 

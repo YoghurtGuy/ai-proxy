@@ -1,0 +1,31 @@
+# 单实例部署。状态（冷却、并发槽、粘性会话、用量计数）全在进程内存里，
+# 起多个副本会各算各的，所以不要 --scale。
+
+services:
+  ai-proxy:
+    image: registry.cn-beijing.aliyuncs.com/xjtuedu/ai-proxy:latest
+    # 想用本地源码构建，删掉上面一行、放开下面这行
+    # build: .
+    container_name: ai-proxy
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    # 需要同目录下有 .env（cp .env.example .env 后改密码）
+    env_file:
+      - .env
+    volumes:
+      - ai-proxy-data:/data
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 512M
+    # 请求明细是按天滚动的 JSONL，给日志驱动也加个上限，免得磁盘被吃满
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ai-proxy-data:

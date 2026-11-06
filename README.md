@@ -146,6 +146,40 @@ location /v1/ {
 
 ---
 
+## Docker
+
+```bash
+docker build -t ai-proxy .
+docker run -d --name ai-proxy \
+  -p 3000:3000 \
+  -e ADMIN_PASSWORD='换成强密码' \
+  -v ai-proxy-data:/data \
+  --restart unless-stopped \
+  ai-proxy
+```
+
+`/data` 里是 `config.json`、`usage.json` 和请求明细，**必须挂卷**，否则重建容器配置就没了。
+
+镜像用 Next 的 standalone 产物，非 root 运行，自带 `HEALTHCHECK`（打 `/login`，不需要鉴权）。
+单实例限制在容器里同样成立：不要 `--scale` 多副本，内存态会各算各的。
+
+> `.dockerignore` 排除了 `data/`，这一步很关键：`next build` 会把项目里存在的 `data/`
+> 追踪进 `.next/standalone`，构建上下文里要是有它，上游密钥就会被烤进镜像层。
+
+### GitHub Actions
+
+`.github/workflows/docker.yml`，`git tag v0.2.0 && git push --tags` 触发构建并推送到阿里云 ACR：
+
+| 触发方式 | 推送的 tag |
+|---|---|
+| 打 tag（`v*`） | `:0.2.0`（去掉 `v` 前缀）+ `:latest` |
+| Actions 页面 Run workflow | `:<sha7>`，不动 latest |
+
+需要先配好仓库 Secrets：`ACR_USERNAME` / `ACR_PASSWORD`（Settings > Secrets and variables > Actions）。
+镜像名在 workflow 的 `env.IMAGE_NAME` 里改。
+
+---
+
 ## 开发
 
 ```bash

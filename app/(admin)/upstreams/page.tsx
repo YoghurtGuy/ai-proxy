@@ -303,9 +303,19 @@ export default function UpstreamsPage() {
                           </span>
                         </div>
                       </TableCell>
-                      <TableCell className="max-w-[240px] truncate font-mono text-xs">{up.baseUrl}</TableCell>
+                      <TableCell className="font-mono text-xs">
+                        <div className="max-w-[220px] truncate" title={up.baseUrl}>
+                          {up.baseUrl}
+                        </div>
+                      </TableCell>
                       <TableCell className="text-xs text-muted-foreground">
-                        {up.models.includes("*") ? "全部" : up.models.join(", ")}
+                        <div className="max-w-[220px] truncate" title={up.models.join("\n")}>
+                          {up.models.includes("*")
+                            ? "全部"
+                            : up.models.length <= 3
+                              ? up.models.join(", ")
+                              : `${up.models.length} 个模型`}
+                        </div>
                       </TableCell>
                       <TableCell className="text-xs tabular-nums">
                         {up.priority} / {up.concurrency}

@@ -40,8 +40,8 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
   };
 
   return (
-    <div className="flex min-h-screen">
-      <aside className="flex w-56 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground">
+    <div className="flex h-dvh overflow-hidden">
+      <aside className="flex w-56 shrink-0 flex-col overflow-y-auto border-r bg-sidebar text-sidebar-foreground">
         <div className="flex h-14 items-center gap-2 border-b px-4">
           <span className="text-sm font-semibold tracking-tight">AI Proxy</span>
         </div>
@@ -75,7 +75,7 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
           </Button>
         </div>
       </aside>
-      <main className="flex-1 overflow-x-hidden bg-background">
+      <main className="flex-1 overflow-x-hidden overflow-y-auto bg-background">
         <div className="mx-auto w-full max-w-6xl px-6 py-6">{children}</div>
       </main>
     </div>

@@ -77,13 +77,31 @@ export async function verifySessionToken(token: string | undefined | null, now =
   return timingSafeEqual(signature, expected);
 }
 
-export const SESSION_COOKIE_OPTIONS = {
+const COOKIE_BASE = {
   httpOnly: true,
   sameSite: "lax" as const,
   path: "/",
-  secure: process.env.NODE_ENV === "production",
   maxAge: Math.floor(SESSION_TTL_MS / 1000),
 };
+
+/**
+ * 算 cookie 属性。
+ *
+ * `Secure` 不能按 NODE_ENV 写死：浏览器会静默丢掉 http 页面上的 Secure cookie，
+ * 表现就是登录接口返回 200 但下一秒还是未登录（内网 IP 直连、没上 HTTPS 时最典型）。
+ *
+ * 优先看反向代理给的 x-forwarded-proto，其次看请求自身的协议。
+ * 需要强制时用 COOKIE_SECURE=true/false 覆盖。
+ */
+export function sessionCookieOptions(req?: Request) {
+  const override = process.env.COOKIE_SECURE;
+  if (override === "true") return { ...COOKIE_BASE, secure: true };
+  if (override === "false") return { ...COOKIE_BASE, secure: false };
+
+  const forwarded = req?.headers.get("x-forwarded-proto")?.split(",")[0].trim().toLowerCase();
+  const proto = forwarded || (req ? new URL(req.url).protocol.replace(":", "") : "");
+  return { ...COOKIE_BASE, secure: proto === "https" };
+}
 
 /** route handler 里判断当前请求是否已登录。 */
 export async function isAdmin(): Promise<boolean> {

@@ -1,5 +1,5 @@
 import { cookies } from "next/headers";
-import { SESSION_COOKIE, SESSION_COOKIE_OPTIONS, adminPasswordConfigured, checkPassword, createSessionToken } from "@/lib/auth";
+import { SESSION_COOKIE, adminPasswordConfigured, checkPassword, createSessionToken, sessionCookieOptions } from "@/lib/auth";
 
 export async function POST(req: Request): Promise<Response> {
   if (!adminPasswordConfigured()) {
@@ -18,6 +18,6 @@ export async function POST(req: Request): Promise<Response> {
     return Response.json({ error: "密码错误" }, { status: 401 });
   }
   const jar = await cookies();
-  jar.set(SESSION_COOKIE, await createSessionToken(), SESSION_COOKIE_OPTIONS);
+  jar.set(SESSION_COOKIE, await createSessionToken(), sessionCookieOptions(req));
   return Response.json({ ok: true });
 }

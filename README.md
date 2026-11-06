@@ -36,7 +36,8 @@ Base URL 填 `http://<host>:3000/v1`，和 OpenAI 完全一致。
 |---|---|---|
 | `ADMIN_PASSWORD` | 是 | 管理后台登录密码 |
 | `AUTH_SECRET` | 否 | cookie 签名密钥，不填则用 `ADMIN_PASSWORD` |
-| `DATA_DIR` | 否 | 数据目录，默认 `./data` |
+| `DATA_DIR` | 否 | 数据目录，默认 `./data`（镜像里已设成 `/data`） |
+| `COOKIE_SECURE` | 否 | 登录 cookie 是否带 `Secure`。默认按请求协议判断（HTTPS 才加），一般不用配 |
 
 ---
 

@@ -1,7 +1,6 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -10,7 +9,6 @@ import { Label } from "@/components/ui/label";
 import { apiSend } from "@/lib/client";
 
 export default function LoginPage() {
-  const router = useRouter();
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -19,8 +17,9 @@ export default function LoginPage() {
     setBusy(true);
     try {
       await apiSend("/api/admin/login", "POST", { password });
-      router.replace("/");
-      router.refresh();
+      // 登录态变更用整页跳转：确保浏览器一定带上新 cookie、服务端重新渲染
+      // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+      window.location.assign("/");
     } catch (err) {
       toast.error((err as Error).message);
       setBusy(false);

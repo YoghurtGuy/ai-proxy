@@ -275,8 +275,8 @@ export function normalizeUpstream(raw: unknown, index: number): Upstream {
     quota = {
       provider,
       region: asString(quotaRaw.region, `${where}.quota.region`, "cn-beijing"),
-      accessKey: asString(quotaRaw.accessKey, `${where}.quota.accessKey`),
-      secretKey: asString(quotaRaw.secretKey, `${where}.quota.secretKey`),
+      accessKey: asString(quotaRaw.accessKey, `${where}.quota.accessKey`).trim(),
+      secretKey: asString(quotaRaw.secretKey, `${where}.quota.secretKey`).trim(),
       minRemainingPct: asNumber(quotaRaw.minRemainingPct, `${where}.quota.minRemainingPct`, 5, 0, 100),
     };
   }
@@ -285,7 +285,7 @@ export function normalizeUpstream(raw: unknown, index: number): Upstream {
     id,
     name: asString(o.name, `${where}.name`) || id,
     baseUrl: normalizeBaseUrl(asString(o.baseUrl, `${where}.baseUrl`, ""), `${where}.baseUrl`),
-    apiKey: asString(o.apiKey, `${where}.apiKey`),
+    apiKey: asString(o.apiKey, `${where}.apiKey`).trim(),
     models: asStringArray(o.models, `${where}.models`, ["*"]),
     priority: asNumber(o.priority, `${where}.priority`, 50, 0, 1_000_000),
     concurrency: Math.round(asNumber(o.concurrency, `${where}.concurrency`, 8, 1, 10_000)),
@@ -301,7 +301,7 @@ export function normalizeKey(raw: unknown, index: number): DownstreamKey {
   return {
     id,
     name: asString(o.name, `${where}.name`) || id,
-    key: asString(o.key, `${where}.key`),
+    key: asString(o.key, `${where}.key`).trim(),
     enabled: asBool(o.enabled, `${where}.enabled`, true),
     limits: normalizeKeyLimits(o.limits, `${where}.limits`),
   };

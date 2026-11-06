@@ -163,16 +163,27 @@ export default function UpstreamsPage() {
   const test = async (up: UpstreamRow) => {
     const id = toast.loading(`正在测试 ${up.name}…`);
     try {
-      const res = await apiSend<{ result: { ok: boolean; status: number; ms: number; detail: string; sample: string[] } }>(
-        "/api/admin/actions",
-        "POST",
-        { action: "testUpstream", id: up.id },
-      );
+      const res = await apiSend<{
+        result: {
+          ok: boolean;
+          status: number;
+          ms: number;
+          detail: string;
+          hint?: string;
+          sample: string[];
+        };
+      }>("/api/admin/actions", "POST", { action: "testUpstream", id: up.id });
       const r = res.result;
-      toast[r.ok ? "success" : "error"](
-        r.ok ? `${up.name} 连通，${r.ms}ms，${r.sample.length} 个模型` : `${up.name} 失败：HTTP ${r.status} ${r.detail}`,
-        { id },
-      );
+      const hint = r.hint ? ` — ${r.hint}` : "";
+      if (r.ok) {
+        const extra = r.sample.length ? `${r.sample.length} 个模型` : r.detail;
+        toast.success(`${up.name} 连通，${r.ms}ms${extra ? `，${extra}` : ""}`, { id });
+      } else {
+        toast.error(`${up.name} 失败：HTTP ${r.status}${r.detail ? ` ${r.detail}` : ""}${hint}`, {
+          id,
+          duration: 15000,
+        });
+      }
     } catch (err) {
       toast.error((err as Error).message, { id });
     }

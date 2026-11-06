@@ -12,6 +12,7 @@ import { lineScanner } from "../lib/stream";
 import { parseCooldownMs, sessionHash } from "../lib/forward";
 import { markCooldown, releaseUpstream, selectAndAcquire, upState } from "../lib/scheduler";
 import { normalizeConfig } from "../lib/types";
+import { authHint } from "../lib/hints";
 import { signRequest, fetchVolcengineQuota } from "../lib/quota/volcengine";
 
 let passed = 0;
@@ -378,6 +379,43 @@ await checkAsync("缺少 AK/SK 时不发起请求", async () => {
   } finally {
     globalThis.fetch = original;
   }
+});
+
+// ---------------------------------------------------------------------------
+// 6. 上游探测的鉴权提示
+// ---------------------------------------------------------------------------
+
+const AGENT_PLAN = "https://ark.cn-beijing.volces.com/api/plan/v3";
+const CODING_PLAN = "https://ark.cn-beijing.volces.com/api/coding/v3";
+const DATA_PLANE = "https://ark.cn-beijing.volces.com/api/v3";
+
+check("套餐 key 打到按量计费入口 → 提示改 /api/plan/v3", () => {
+  const hint = authHint(DATA_PLANE, "ark-d6abcdef", 401);
+  assert.match(hint, /api\/plan\/v3/);
+  assert.match(hint, /套餐 key 在这里无效/);
+});
+
+check("套餐 key 用对了入口 → 回退到通用提示", () => {
+  const hint = authHint(AGENT_PLAN, "ark-d6abcdef", 401);
+  assert.match(hint, /同一个账号和地域/);
+});
+
+check("Coding Plan 入口也算套餐入口", () => {
+  assert.match(authHint(CODING_PLAN, "ark-d6abcdef", 401), /同一个账号和地域/);
+});
+
+check("按量计费 key 打到套餐入口 → 提示 key 类型不对", () => {
+  const hint = authHint(AGENT_PLAN, "sk-abcdef", 401);
+  assert.match(hint, /只认 Agent Plan/);
+});
+
+check("非鉴权错误不给提示", () => {
+  assert.equal(authHint(DATA_PLANE, "ark-d6abcdef", 200), "");
+  assert.equal(authHint(DATA_PLANE, "ark-d6abcdef", 500), "");
+});
+
+check("403 也当鉴权问题处理", () => {
+  assert.notEqual(authHint(DATA_PLANE, "ark-d6abcdef", 403), "");
 });
 
 console.log(`\n${passed} 项通过${process.exitCode ? "，有失败" : ""}`);

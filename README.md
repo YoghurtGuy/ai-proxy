@@ -65,6 +65,27 @@ Base URL 填 `http://<host>:3000/v1`，和 OpenAI 完全一致。
 | 套餐额度（Agent Plan） | 填 IAM AK/SK，打开「套餐额度查询」 | 定时拉 5 小时 / 日 / 周 / 月四个窗口的 AFP 额度；剩余低于阈值就暂停调度 |
 | 按量计费 | 额度留空 | 不参与额度调度，只用优先级 / 负载 / 健康度均衡 |
 
+### 火山方舟的 Base URL 与 key 前缀必须配对
+
+这是最容易踩的坑：`ark-` 开头的 key 是套餐专属 key，填到按量计费入口会直接 401
+（`The API key or AK/SK in the request is missing or invalid`）。
+
+| 权益 | OpenAI 兼容 Base URL | Anthropic 兼容 |
+|---|---|---|
+| 按量计费 | `https://ark.cn-beijing.volces.com/api/v3` | — |
+| Agent Plan | `https://ark.cn-beijing.volces.com/api/plan/v3` | `…/api/plan` |
+| Coding Plan | `https://ark.cn-beijing.volces.com/api/coding/v3` | `…/api/coding` |
+
+key 前缀对应关系：`sk-…` → 按量计费；`ark-…` → 套餐专属。
+
+另外 Agent Plan 的入口**没有 `/models` 路由**（返回 404），所以「测试」按钮做的是两步探测：
+先打 `/models`，拿到 404 再发一个缺 `model` 的空 `POST /chat/completions`——
+这种请求会在鉴权之后、生成之前被拒（400），既能确认连通又不消耗额度。
+
+> Agent Plan 只允许调用套餐内的模型（如 `ark-code-latest`），而且官方明确说明
+> 文本生成/向量化模型不可用于 API 调用，在非 AI 工具里使用套餐 Base URL 和 key
+> 可能被判定为滥用导致订阅停用。拿它当通用 LLM 网关前请先确认自己的用法在允许范围内。
+
 关于额度：
 
 - 用的是 `GetAFPUsage`，**只适用于个人版 Agent Plan**。企业版席位要换 `GetSeatAFPUsage`。

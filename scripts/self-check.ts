@@ -12,12 +12,24 @@ import { lineScanner } from "../lib/stream";
 import { parseCooldownMs, sessionHash } from "../lib/forward";
 import { markCooldown, releaseUpstream, selectAndAcquire, upState } from "../lib/scheduler";
 import { normalizeConfig } from "../lib/types";
-import { signRequest } from "../lib/quota/volcengine";
+import { signRequest, fetchVolcengineQuota } from "../lib/quota/volcengine";
 
 let passed = 0;
 function check(name: string, fn: () => void) {
   try {
     fn();
+    passed += 1;
+    console.log(`  ok  ${name}`);
+  } catch (err) {
+    console.error(`FAIL  ${name}`);
+    console.error(`      ${(err as Error).message}`);
+    process.exitCode = 1;
+  }
+}
+
+async function checkAsync(name: string, fn: () => Promise<void>) {
+  try {
+    await fn();
     passed += 1;
     console.log(`  ok  ${name}`);
   } catch (err) {
@@ -275,6 +287,97 @@ check("同一对话首条消息 → 同一个指纹", () => {
 check("多模态 content 数组能取到文本", () => {
   const body = { messages: [{ role: "user", content: [{ type: "text", text: "看图" }, { type: "image_url" }] }] };
   assert.equal(sessionHash("k1", body).length, 32);
+});
+
+const AFP_SAMPLE = {
+  ResponseMetadata: { RequestId: "x", Action: "GetAFPUsage", Version: "2024-01-01", Service: "ark" },
+  Result: {
+    PlanType: "Large",
+    AFPFiveHour: { Quota: "50", Used: "12.5", SubscribeTime: 1778788800000, ResetTime: 1778806800000 },
+    AFPDaily: { Quota: "100", Used: "22.5", SubscribeTime: 1778716800000, ResetTime: 1778803200000 },
+    AFPWeekly: { Quota: "500", Used: "150", SubscribeTime: 1778457600000, ResetTime: 1779062400000 },
+    AFPMonthly: { Quota: "2000", Used: "850.5", SubscribeTime: 1777939200000, ResetTime: 1780531200000 },
+  },
+};
+
+async function withStubbedFetch<T>(
+  reply: () => Response,
+  fn: (captured: { url: string; headers: Record<string, string> }) => Promise<T>,
+): Promise<T> {
+  const original = globalThis.fetch;
+  const captured = { url: "", headers: {} as Record<string, string> };
+  globalThis.fetch = (async (input: unknown, init: { headers?: Record<string, string> }) => {
+    captured.url = String(input);
+    captured.headers = init?.headers ?? {};
+    return reply();
+  }) as typeof fetch;
+  try {
+    return await fn(captured);
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+const QUOTA_CFG = {
+  provider: "volcengine-afp" as const,
+  region: "cn-beijing",
+  accessKey: "demo-ak",
+  secretKey: "ZGVtb3NlY3JldA==",
+  minRemainingPct: 5,
+};
+
+await checkAsync("GetAFPUsage 解析四个窗口并取最小剩余比例", async () => {
+  const snapshot = await withStubbedFetch(
+    () => new Response(JSON.stringify(AFP_SAMPLE), { status: 200 }),
+    async (captured) => {
+      const result = await fetchVolcengineQuota(QUOTA_CFG);
+      // 端点必须是管控面网关，不能是数据面的 volces.com
+      assert.equal(captured.url, "https://ark.cn-beijing.volcengineapi.com/?Action=GetAFPUsage&Version=2024-01-01");
+      assert.match(captured.headers.Authorization, /^HMAC-SHA256 Credential=demo-ak\/\d{8}\/cn-beijing\/ark\/request, /);
+      return result;
+    },
+  );
+
+  assert.equal(snapshot.error, undefined);
+  assert.equal(snapshot.planType, "Large");
+  assert.deepEqual(Object.keys(snapshot.windows).sort(), ["daily", "fiveHour", "monthly", "weekly"]);
+  // 字符串金额要能转成数字
+  assert.equal(snapshot.windows.fiveHour.quota, 50);
+  assert.equal(snapshot.windows.monthly.used, 850.5);
+  assert.equal(snapshot.windows.weekly.resetTime, 1779062400000);
+  // fiveHour 75% / daily 77.5% / weekly 70% / monthly 57.475% → 取最小
+  assert.equal(Math.round(snapshot.remainingPct * 1000) / 1000, 57.475);
+});
+
+await checkAsync("GetAFPUsage 业务错误不抛异常，落到 error 字段", async () => {
+  const snapshot = await withStubbedFetch(
+    () =>
+      new Response(
+        JSON.stringify({
+          ResponseMetadata: { Error: { Code: "InvalidAccessKey", Message: "token is invalid" } },
+        }),
+        { status: 200 },
+      ),
+    () => fetchVolcengineQuota(QUOTA_CFG),
+  );
+  assert.match(snapshot.error ?? "", /InvalidAccessKey/);
+  assert.equal(snapshot.remainingPct, 0);
+});
+
+await checkAsync("缺少 AK/SK 时不发起请求", async () => {
+  let called = false;
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    called = true;
+    return new Response("{}", { status: 200 });
+  }) as unknown as typeof fetch;
+  try {
+    const snapshot = await fetchVolcengineQuota({ ...QUOTA_CFG, accessKey: "", secretKey: "" });
+    assert.equal(called, false);
+    assert.match(snapshot.error ?? "", /AK\/SK/);
+  } finally {
+    globalThis.fetch = original;
+  }
 });
 
 console.log(`\n${passed} 项通过${process.exitCode ? "，有失败" : ""}`);

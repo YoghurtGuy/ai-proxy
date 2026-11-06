@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "check": "bun scripts/self-check.ts",
+    "check": "bun scripts/self-check.ts && bun scripts/render-check.tsx",
     "mock": "bun scripts/mock-upstream.ts"
   },
   "dependencies": {

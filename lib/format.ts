@@ -6,6 +6,28 @@ export function formatNumber(n: number): string {
   return String(Math.round(n));
 }
 
+/** AFP 额度可能是小数，保留小数以免把 850.5 显示成 851。 */
+export function formatAfp(n: number): string {
+  if (!Number.isFinite(n)) return "0";
+  if (!Number.isInteger(n) && Math.abs(n) < 10_000) return n.toFixed(1);
+  return formatNumber(n);
+}
+
+/** 额度重置时间：比别人要等的“距离刷新还多久”更粗一点。 */
+export function formatReset(ts: number, now: number): string {
+  if (!ts) return "—";
+  const ms = ts - now;
+  if (ms <= 0) return "即将重置";
+  const totalMin = Math.ceil(ms / 60_000);
+  if (totalMin < 60) return `${totalMin} 分后`;
+  const hours = Math.floor(totalMin / 60);
+  const mins = totalMin % 60;
+  if (hours < 24) return mins ? `${hours} 小时 ${mins} 分后` : `${hours} 小时后`;
+  const days = Math.floor(hours / 24);
+  const restHours = hours % 24;
+  return restHours ? `${days} 天 ${restHours} 小时后` : `${days} 天后`;
+}
+
 export function formatMs(ms: number): string {
   if (!ms || !Number.isFinite(ms)) return "—";
   if (ms >= 1000) return `${(ms / 1000).toFixed(2)}s`;

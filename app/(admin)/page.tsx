@@ -7,7 +7,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { TrafficChart, type TrafficPoint } from "@/components/traffic-chart";
 import { useResource, useNow } from "@/lib/client";
-import { countdown, errorRate, formatMs, formatNumber } from "@/lib/format";
+import { countdown, errorRate, formatAfp, formatMs, formatNumber, formatReset, formatTime } from "@/lib/format";
 
 interface Summary {
   req: number;
@@ -53,6 +53,7 @@ interface UpstreamRow {
   priority: number;
   concurrency: number;
   hasQuota: boolean;
+  minRemainingPct: number;
   today: Summary;
   runtime: UpstreamRuntime;
 }
@@ -73,6 +74,92 @@ interface Overview {
   keys: KeyRow[];
   models: ({ model: string } & Summary)[];
   dataDir: string;
+}
+
+/** 上游套餐额度的窗口顺序与中文名。只渲染上游实际返回的窗口。 */
+const WINDOW_ORDER = ["fiveHour", "daily", "weekly", "monthly"] as const;
+const WINDOW_LABELS: Record<string, string> = {
+  fiveHour: "5 小时",
+  daily: "今日",
+  weekly: "本周",
+  monthly: "本月",
+};
+
+function WindowBar({
+  label,
+  win,
+  minRemainingPct,
+  now,
+}: {
+  label: string;
+  win: QuotaWindow;
+  minRemainingPct: number;
+  now: number;
+}) {
+  const pct = win.quota > 0 ? Math.max(0, Math.min(100, ((win.quota - win.used) / win.quota) * 100)) : 0;
+  const low = pct <= minRemainingPct;
+  const tone = low ? "bg-destructive" : pct < 30 ? "bg-amber-500" : "bg-emerald-500";
+  return (
+    <div className="flex flex-col gap-1.5 rounded-lg border p-2.5">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-xs text-muted-foreground">{label}</span>
+        <span className={`text-xs tabular-nums ${low ? "font-medium text-destructive" : ""}`}>{pct.toFixed(1)}%</span>
+      </div>
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+        <div className={`h-full rounded-full ${tone}`} style={{ width: `${pct}%` }} />
+      </div>
+      <span className="text-[11px] tabular-nums text-muted-foreground">
+        {formatAfp(win.used)} / {formatAfp(win.quota)} AFP
+      </span>
+      <span className="text-[11px] text-muted-foreground">{formatReset(win.resetTime, now)}</span>
+    </div>
+  );
+}
+
+/** 导出来给渲染测试用，便于直接验证额度面板的产出。 */
+export function QuotaPanel({ upstreams, now }: { upstreams: UpstreamRow[]; now: number }) {
+  const rows = upstreams.filter((up) => up.runtime?.quota);
+  if (rows.length === 0) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        没有上游配置套餐额度查询。按量计费上游不消耗套餐额度，可以忽略这里。
+      </p>
+    );
+  }
+  return (
+    <div className="flex flex-col gap-5">
+      {rows.map((up) => {
+        const snapshot = up.runtime!.quota!;
+        const windows = WINDOW_ORDER.filter((key) => snapshot.windows[key]);
+        return (
+          <div key={up.id} className="flex flex-col gap-2">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <span className="text-sm font-medium">{up.name}</span>
+              {snapshot.planType ? <Badge variant="outline">{snapshot.planType}</Badge> : null}
+              {!up.enabled ? <Badge variant="secondary">已停用</Badge> : null}
+              <span className="text-xs text-muted-foreground">触发阈值 {up.minRemainingPct}%</span>
+              <span className="text-xs text-muted-foreground">· 更新于 {formatTime(snapshot.fetchedAt)}</span>
+            </div>
+            {snapshot.error ? (
+              <p className="text-xs text-destructive">额度获取失败：{snapshot.error}</p>
+            ) : (
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                {windows.map((key) => (
+                  <WindowBar
+                    key={key}
+                    label={WINDOW_LABELS[key]}
+                    win={snapshot.windows[key]}
+                    minRemainingPct={up.minRemainingPct}
+                    now={now}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 function StatCard({
@@ -106,7 +193,9 @@ function UpstreamStatus({ row, now }: { row: UpstreamRow; now: number }) {
   if (row.runtime.cooldownUntil > now) {
     return <Badge variant="destructive">冷却 {countdown(row.runtime.cooldownUntil, now)}</Badge>;
   }
-  if (row.runtime.quota && row.runtime.quota.remainingPct < 5) return <Badge variant="destructive">额度不足</Badge>;
+  if (row.runtime.quota && row.runtime.quota.remainingPct < row.minRemainingPct) {
+    return <Badge variant="destructive">额度不足</Badge>;
+  }
   if (row.runtime.errEwma > 0.5) return <Badge variant="secondary">错误率高</Badge>;
   return <Badge variant="outline" className="border-emerald-500/40 text-emerald-600 dark:text-emerald-400">正常</Badge>;
 }
@@ -249,6 +338,16 @@ export default function DashboardPage() {
               )}
             </TableBody>
           </Table>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>套餐额度</CardTitle>
+          <CardDescription>Agent Plan 各滚动窗口的 AFP 用量，任意窗口低于阈值就会暂停该上游调度</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <QuotaPanel upstreams={data?.upstreams ?? []} now={now} />
         </CardContent>
       </Card>
 

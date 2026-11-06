@@ -20,6 +20,7 @@ export async function GET(): Promise<Response> {
         priority: up.priority,
         concurrency: up.concurrency,
         hasQuota: Boolean(up.quota),
+        minRemainingPct: up.quota?.minRemainingPct ?? 0,
         today: summarize(buckets[`upstream:${up.id}`]),
         runtime: {
           inflight: state?.inflight ?? 0,

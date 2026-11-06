@@ -66,3 +66,7 @@ jobs:
           # 层缓存放 GitHub Actions 缓存，比每次全量重建快很多
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # ACR 不认 provenance 生成的空描述符
+          # （application/vnd.oci.empty.v1+json），会把镜像打成 manifest list 后直接 denied。
+          # 关掉就是普通单镜像 manifest。
+          provenance: false

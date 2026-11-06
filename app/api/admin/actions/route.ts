@@ -1,7 +1,9 @@
 import { adminHandler, readJson } from "@/lib/admin";
 import { authHint } from "@/lib/hints";
+import { listUpstreamModels } from "@/lib/models";
 import { pruneRuntime } from "@/lib/scheduler";
 import { getConfig, reloadConfig } from "@/lib/store";
+import { normalizeUpstream, type Upstream } from "@/lib/types";
 
 /**
  * 上游连通性探测。
@@ -87,6 +89,19 @@ export async function POST(req: Request): Promise<Response> {
       const up = config.upstreams.find((u) => u.id === String(body.id ?? ""));
       if (!up) return Response.json({ error: "上游不存在" }, { status: 404 });
       return Response.json({ ok: true, result: await testUpstream(up.baseUrl, up.apiKey) });
+    }
+
+    if (action === "listModels") {
+      // 编辑框里还没保存的上游也能拉：直接校验前端传过来的草稿
+      let target: Upstream | undefined;
+      if (body.draft && typeof body.draft === "object") {
+        target = normalizeUpstream({ ...(body.draft as object), id: "draft" }, 0);
+      } else {
+        const config = await getConfig();
+        target = config.upstreams.find((u) => u.id === String(body.id ?? ""));
+      }
+      if (!target) return Response.json({ error: "上游不存在" }, { status: 404 });
+      return Response.json({ ok: true, result: await listUpstreamModels(target, { refresh: true }) });
     }
 
     return Response.json({ error: `未知操作: ${action}` }, { status: 400 });

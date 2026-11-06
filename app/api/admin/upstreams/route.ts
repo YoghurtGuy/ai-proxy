@@ -1,4 +1,5 @@
 import { adminHandler, readJson } from "@/lib/admin";
+import { clearModelCache } from "@/lib/models";
 import { fetchVolcengineQuota } from "@/lib/quota/volcengine";
 import { clearCooldown, pruneRuntime, setQuota, upstreamSnapshot } from "@/lib/scheduler";
 import { getConfig, newId, updateConfig } from "@/lib/store";
@@ -21,6 +22,7 @@ export async function POST(req: Request): Promise<Response> {
       c.upstreams.push({ ...body, id: newId("u") } as unknown as Upstream);
     });
     pruneRuntime(config);
+    clearModelCache();
     return Response.json({ ok: true, upstreams: config.upstreams }, { status: 201 });
   });
 }
@@ -36,6 +38,7 @@ export async function PUT(req: Request): Promise<Response> {
       c.upstreams[index] = { ...c.upstreams[index], ...body, id } as Upstream;
     });
     pruneRuntime(config);
+    clearModelCache(id);
     return Response.json({ ok: true, upstreams: config.upstreams });
   });
 }
@@ -48,6 +51,7 @@ export async function DELETE(req: Request): Promise<Response> {
       c.upstreams = c.upstreams.filter((u) => u.id !== id);
     });
     pruneRuntime(config);
+    clearModelCache(id);
     return Response.json({ ok: true });
   });
 }

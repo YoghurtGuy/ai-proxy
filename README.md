@@ -78,9 +78,15 @@ Base URL 填 `http://<host>:3000/v1`，和 OpenAI 完全一致。
 
 key 前缀对应关系：`sk-…` → 按量计费；`ark-…` → 套餐专属。
 
-另外 Agent Plan 的入口**没有 `/models` 路由**（返回 404），所以「测试」按钮做的是两步探测：
-先打 `/models`，拿到 404 再发一个缺 `model` 的空 `POST /chat/completions`——
-这种请求会在鉴权之后、生成之前被拒（400），既能确认连通又不消耗额度。
+另外 Agent Plan 的入口**没有 `/models` 路由**（返回 404），所以：
+
+- **测试按钮**做两步探测：先打 `/models`，拿到 404 再发一个缺 `model` 的空
+  `POST /chat/completions`——这种请求会在鉴权之后、生成之前被拒（400），
+  既能确认连通又不消耗额度。
+- **模型列表**改走管控面 `ListArkAgentPlanModel`（需要该上游填了 AK/SK），
+  返回 27 个模型并带 `Load.Status` 实时可用性；不可用的会被过滤掉。
+  结果缓存 10 分钟——这套接口有 QPS 限制，打太快会返回 `AccountFlowLimitExceeded`。
+- 上游编辑框里有「拉取模型」按钮，直接把探测到的列表填进模型输入框（保存后生效）。
 
 > Agent Plan 只允许调用套餐内的模型（如 `ark-code-latest`），而且官方明确说明
 > 文本生成/向量化模型不可用于 API 调用，在非 AI 工具里使用套餐 Base URL 和 key

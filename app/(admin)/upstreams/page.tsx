@@ -116,6 +116,28 @@ export default function UpstreamsPage() {
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [busy, setBusy] = useState(false);
+  const [fetchingModels, setFetchingModels] = useState(false);
+
+  const fetchModels = async () => {
+    setFetchingModels(true);
+    try {
+      const res = await apiSend<{
+        result: { models: string[]; source: string; error?: string };
+      }>("/api/admin/actions", "POST", { action: "listModels", draft: payloadOf(form) });
+      const { models, source, error } = res.result;
+      if (models.length > 0) {
+        set("modelsText", models.join(", "));
+        const label = source === "agent-plan" ? "Agent Plan 套餐" : source === "models-api" ? "/models" : "配置";
+        toast.success(`从${label}拉到 ${models.length} 个模型，已填入（记得保存）`);
+      } else {
+        toast.warning(error ? `没拉到模型：${error}` : "没拉到模型，保留原来的值");
+      }
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setFetchingModels(false);
+    }
+  };
 
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((f) => ({ ...f, [key]: value }));
 
@@ -368,13 +390,29 @@ export default function UpstreamsPage() {
             </div>
 
             <div className="flex flex-col gap-1.5">
-              <Label htmlFor="up-models">模型（逗号分隔，* 表示全部）</Label>
+              <div className="flex items-center justify-between gap-2">
+                <Label htmlFor="up-models">模型（逗号分隔，* 表示全部）</Label>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="xs"
+                  disabled={fetchingModels || !form.baseUrl || !form.apiKey}
+                  onClick={fetchModels}
+                >
+                  <RefreshCw className={`size-3 ${fetchingModels ? "animate-spin" : ""}`} />
+                  {fetchingModels ? "拉取中…" : "拉取模型"}
+                </Button>
+              </div>
               <Textarea
                 id="up-models"
-                rows={2}
+                rows={4}
                 value={form.modelsText}
                 onChange={(e) => set("modelsText", e.target.value)}
+                placeholder="* 或 doubao-seed-2.1-pro, kimi-k3.1-pro"
               />
+              <span className="text-xs text-muted-foreground">
+                填 * 时会在请求 /v1/models 时实时探测；Agent Plan 上游需要填上 AK/SK 才能拉到真实模型列表
+              </span>
             </div>
 
             <div className="grid grid-cols-2 gap-3">

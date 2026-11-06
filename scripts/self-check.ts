@@ -13,7 +13,7 @@ import { parseCooldownMs, sessionHash } from "../lib/forward";
 import { markCooldown, releaseUpstream, selectAndAcquire, upState } from "../lib/scheduler";
 import { normalizeConfig } from "../lib/types";
 import { authHint } from "../lib/hints";
-import { signRequest, fetchVolcengineQuota } from "../lib/quota/volcengine";
+import { signRequest, fetchVolcengineQuota, listAgentPlanModels } from "../lib/quota/volcengine";
 
 let passed = 0;
 function check(name: string, fn: () => void) {
@@ -416,6 +416,60 @@ check("非鉴权错误不给提示", () => {
 
 check("403 也当鉴权问题处理", () => {
   assert.notEqual(authHint(DATA_PLANE, "ark-d6abcdef", 403), "");
+});
+
+// ---------------------------------------------------------------------------
+// 7. ListArkAgentPlanModel
+// ---------------------------------------------------------------------------
+
+await checkAsync("ListArkAgentPlanModel 解析模型与可用状态", async () => {
+  const payload = {
+    ResponseMetadata: { RequestId: "x", Action: "ListArkAgentPlanModel", Version: "2024-01-01" },
+    Result: {
+      Datas: [
+        { ModelID: "doubao-seed-2.1-pro", Load: { Status: 1, Level: 2, Score: 2 } },
+        { ModelID: "deepseek-v4.1-flash", Load: { Status: 2, Coverage: 0 } },
+        { ModelID: "glm-5.3", Load: { Status: 1, Level: 1 } },
+        // 没有 Load 的当作可用
+        { ModelID: "no-load-model" },
+        // 坏数据要跳过而不是崩
+        { ModelID: "" },
+        "garbage",
+      ],
+    },
+  };
+
+  const result = await withStubbedFetch(
+    () => new Response(JSON.stringify(payload), { status: 200 }),
+    async (captured) => {
+      const r = await listAgentPlanModels({ region: "cn-beijing", accessKey: "demo-ak", secretKey: "ZGVtbw==" });
+      assert.match(captured.url, /Action=ListArkAgentPlanModel&Version=2024-01-01/);
+      return r;
+    },
+  );
+
+  assert.equal("error" in result, false);
+  const models = (result as { models: { id: string; available: boolean; loadLevel?: number }[] }).models;
+  assert.deepEqual(
+    models.map((m) => m.id),
+    ["doubao-seed-2.1-pro", "deepseek-v4.1-flash", "glm-5.3", "no-load-model"],
+  );
+  assert.equal(models.find((m) => m.id === "doubao-seed-2.1-pro")?.available, true);
+  assert.equal(models.find((m) => m.id === "doubao-seed-2.1-pro")?.loadLevel, 2);
+  assert.equal(models.find((m) => m.id === "deepseek-v4.1-flash")?.available, false);
+  assert.equal(models.find((m) => m.id === "no-load-model")?.available, true);
+});
+
+await checkAsync("ListArkAgentPlanModel 出错时返回 error 而不是抛", async () => {
+  const result = await withStubbedFetch(
+    () =>
+      new Response(
+        JSON.stringify({ ResponseMetadata: { Error: { Code: "AccountFlowLimitExceeded", Message: "too fast" } } }),
+        { status: 429 },
+      ),
+    () => listAgentPlanModels({ region: "cn-beijing", accessKey: "AK", secretKey: "SK" }),
+  );
+  assert.match((result as { error: string }).error, /AccountFlowLimitExceeded/);
 });
 
 console.log(`\n${passed} 项通过${process.exitCode ? "，有失败" : ""}`);

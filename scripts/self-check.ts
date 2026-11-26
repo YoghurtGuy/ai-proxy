@@ -10,7 +10,16 @@
 import assert from "node:assert/strict";
 import { lineScanner } from "../lib/stream";
 import { parseCooldownMs, sessionHash } from "../lib/forward";
-import { markCooldown, releaseUpstream, selectAndAcquire, upState } from "../lib/scheduler";
+import {
+  checkSlopeLimit,
+  markCooldown,
+  releaseUpstream,
+  resetSlopeState,
+  selectAndAcquire,
+  slopeScope,
+  upState,
+  waitForUpstreamSlot,
+} from "../lib/scheduler";
 import { normalizeConfig } from "../lib/types";
 import { authHint } from "../lib/hints";
 import { signRequest, fetchVolcengineQuota, listAgentPlanModels } from "../lib/quota/volcengine";
@@ -473,6 +482,125 @@ await checkAsync("ListArkAgentPlanModel 出错时返回 error 而不是抛", asy
     () => listAgentPlanModels({ region: "cn-beijing", accessKey: "AK", secretKey: "SK" }),
   );
   assert.match((result as { error: string }).error, /AccountFlowLimitExceeded/);
+});
+
+// ---------------------------------------------------------------------------
+// 8. 突发流量排队与斜率保护
+// ---------------------------------------------------------------------------
+
+check("normalizeSettings 自动补全 traffic 默认值", () => {
+  const cfg = normalizeConfig({});
+  assert.equal(cfg.settings.traffic.enabled, true);
+  assert.equal(cfg.settings.traffic.burstQueueWaitMs, 3000);
+  assert.equal(cfg.settings.traffic.slopeWindowSec, 60);
+  assert.equal(cfg.settings.traffic.slopeMaxGrowthRatio, 0.5);
+});
+
+check("斜率保护：基线充足时限制超额增速，空窗后重置", () => {
+  resetSlopeState("test-slope");
+  const traffic = {
+    enabled: true,
+    burstQueueWaitMs: 0,
+    burstQueueMaxSize: 0,
+    slopeWindowSec: 60,
+    slopeMaxGrowthRatio: 0.5,
+    slopeMinBaseline: 10,
+  };
+  const baseTs = 1_700_000_040_000; // 对齐到某 60s 窗口内
+  const w0 = Math.floor(baseTs / 60_000) * 60_000;
+  // 第 0 窗口打入 10 次请求建立基线
+  for (let i = 0; i < 10; i++) {
+    assert.equal(checkSlopeLimit("test-slope", traffic, w0 + i).allowed, true);
+  }
+  // 第 1 窗口最多允许 ceil(10 * 1.5) = 15 次
+  const w1 = w0 + 60_000;
+  for (let i = 0; i < 15; i++) {
+    assert.equal(checkSlopeLimit("test-slope", traffic, w1 + i).allowed, true);
+  }
+  const blocked = checkSlopeLimit("test-slope", traffic, w1 + 100);
+  assert.equal(blocked.allowed, false);
+  if (!blocked.allowed) {
+    assert.equal(blocked.prevCount, 10);
+    assert.equal(blocked.maxAllowed, 15);
+    assert.ok(blocked.retryAfterSec >= 1);
+  }
+  // 跳过一个完整空窗到 w3，基线归零不误杀
+  const w3 = w0 + 180_000;
+  for (let i = 0; i < 20; i++) {
+    assert.equal(checkSlopeLimit("test-slope", traffic, w3 + i).allowed, true);
+  }
+});
+
+await checkAsync("突发排队：上游释放槽位后按模型精准唤醒，超时与队列上限生效", async () => {
+  const traffic = {
+    enabled: true,
+    burstQueueWaitMs: 500,
+    burstQueueMaxSize: 1,
+    slopeWindowSec: 60,
+    slopeMaxGrowthRatio: 0.5,
+    slopeMinBaseline: 20,
+  };
+  const cfg = mkConfig([
+    up("q_up_a", { concurrency: 1, models: ["model-a"] }),
+    up("q_up_b", { concurrency: 1, models: ["model-b"] }),
+  ]);
+  const fa = selectAndAcquire(cfg, "model-a", "");
+  const fb = selectAndAcquire(cfg, "model-b", "");
+  assert.equal(fa.up?.id, "q_up_a");
+  assert.equal(fb.up?.id, "q_up_b");
+
+  const waitA1 = waitForUpstreamSlot("model-a", traffic);
+  const waitA2 = waitForUpstreamSlot("model-a", traffic); // 同模型超出 maxSize=1 被拒绝
+  const waitB1 = waitForUpstreamSlot("model-b", traffic); // 不同模型独立队列不受影响
+
+  assert.equal(await waitA2, false);
+  // 释放 q_up_b 不会错误唤醒 model-a，而是唤醒 model-b
+  releaseUpstream("q_up_b");
+  assert.equal(await waitB1, true);
+  releaseUpstream("q_up_a");
+  assert.equal(await waitA1, true);
+
+  const shortWait = await waitForUpstreamSlot("model-a", { ...traffic, burstQueueWaitMs: 30 });
+  assert.equal(shortWait, false);
+});
+
+check("斜率保护按「上游 × 模型」隔离，超限后自动切到备用上游", () => {
+  resetSlopeState();
+  const traffic = {
+    enabled: true,
+    burstQueueWaitMs: 0,
+    burstQueueMaxSize: 0,
+    slopeWindowSec: 60,
+    slopeMaxGrowthRatio: 0.5,
+    slopeMinBaseline: 10,
+  };
+  const cfg = mkConfig([up("sl_a", { priority: 1 }), up("sl_b", { priority: 50 })], { traffic });
+  const w0 = Math.floor(Date.now() / 60_000) * 60_000 - 60_000;
+  const w1 = w0 + 60_000;
+
+  // 只把 sl_a + model-x 在上个窗口打满基线 10，且当前窗口打满上限 15
+  for (let i = 0; i < 10; i++) {
+    assert.equal(checkSlopeLimit(slopeScope("sl_a", "model-x"), traffic, w0 + i).allowed, true);
+  }
+  for (let i = 0; i < 15; i++) {
+    assert.equal(checkSlopeLimit(slopeScope("sl_a", "model-x"), traffic, w1 + i).allowed, true);
+  }
+
+  // sl_a 的 model-x 超斜率，应自动分流到 sl_b
+  const pickedX = selectAndAcquire(cfg, "model-x", "", new Set(), w1 + 100);
+  assert.equal(pickedX.up?.id, "sl_b");
+  if (pickedX.up) releaseUpstream(pickedX.up.id);
+
+  // sl_a 的 model-y 不受影响，仍优先选中 sl_a
+  const pickedY = selectAndAcquire(cfg, "model-y", "", new Set(), w1 + 100);
+  assert.equal(pickedY.up?.id, "sl_a");
+  if (pickedY.up) releaseUpstream(pickedY.up.id);
+
+  // 如果排除 sl_b，全部上游都触及斜率上限，返回 all_slope_limited
+  const blocked = selectAndAcquire(cfg, "model-x", "", new Set(["sl_b"]), w1 + 100);
+  assert.equal(blocked.up, null);
+  assert.equal(blocked.reason, "all_slope_limited");
+  if (!blocked.up) assert.ok((blocked.retryAfterSec ?? 0) >= 1);
 });
 
 console.log(`\n${passed} 项通过${process.exitCode ? "，有失败" : ""}`);

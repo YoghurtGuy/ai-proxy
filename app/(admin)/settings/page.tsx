@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { apiSend, useResource } from "@/lib/client";
 import type { Settings } from "@/lib/types";
 
@@ -20,9 +21,16 @@ type NumericKey =
   | "weights.load"
   | "weights.quota"
   | "weights.errorRate"
-  | "weights.topK";
+  | "weights.topK"
+  | "traffic.burstQueueWaitMs"
+  | "traffic.burstQueueMaxSize"
+  | "traffic.slopeWindowSec"
+  | "traffic.slopeMaxGrowthRatio"
+  | "traffic.slopeMinBaseline";
 
-type Form = Record<NumericKey, string>;
+type Form = Record<NumericKey, string> & {
+  "traffic.enabled": boolean;
+};
 
 function toForm(settings: Settings): Form {
   return {
@@ -37,6 +45,12 @@ function toForm(settings: Settings): Form {
     "weights.quota": String(settings.weights.quota),
     "weights.errorRate": String(settings.weights.errorRate),
     "weights.topK": String(settings.weights.topK),
+    "traffic.enabled": settings.traffic.enabled,
+    "traffic.burstQueueWaitMs": String(settings.traffic.burstQueueWaitMs),
+    "traffic.burstQueueMaxSize": String(settings.traffic.burstQueueMaxSize),
+    "traffic.slopeWindowSec": String(settings.traffic.slopeWindowSec),
+    "traffic.slopeMaxGrowthRatio": String(settings.traffic.slopeMaxGrowthRatio),
+    "traffic.slopeMinBaseline": String(settings.traffic.slopeMinBaseline),
   };
 }
 
@@ -55,6 +69,14 @@ function payloadOf(form: Form): Settings {
       quota: n("weights.quota"),
       errorRate: n("weights.errorRate"),
       topK: n("weights.topK"),
+    },
+    traffic: {
+      enabled: form["traffic.enabled"],
+      burstQueueWaitMs: n("traffic.burstQueueWaitMs"),
+      burstQueueMaxSize: n("traffic.burstQueueMaxSize"),
+      slopeWindowSec: n("traffic.slopeWindowSec"),
+      slopeMaxGrowthRatio: n("traffic.slopeMaxGrowthRatio"),
+      slopeMinBaseline: n("traffic.slopeMinBaseline"),
     },
   };
 }
@@ -89,7 +111,7 @@ export default function SettingsPage() {
   // 没改过就直接用服务端数据，避免在 effect 里 setState 造成级联渲染
   const form = draft ?? (data ? toForm(data.settings) : null);
 
-  const set = (key: NumericKey, value: string) =>
+  const set = <K extends keyof Form>(key: K, value: Form[K]) =>
     setDraft((prev) => {
       const base = prev ?? (data ? toForm(data.settings) : null);
       return base ? { ...base, [key]: value } : prev;
@@ -197,6 +219,62 @@ export default function SettingsPage() {
             onChange={(v) => set("weights.errorRate", v)}
           />
           <Field id="w-topk" label="topK" hint="越大越分散" value={form["weights.topK"]} onChange={(v) => set("weights.topK", v)} />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <CardTitle>突发流量与斜率保护</CardTitle>
+              <CardDescription>仅针对上游：并发满时按模型排队平滑毛刺，并按「上游 × 模型」隔离限制跨周期增速</CardDescription>
+            </div>
+            <div className="flex items-center gap-2">
+              <Label htmlFor="traffic-enabled">启用保护</Label>
+              <Switch
+                id="traffic-enabled"
+                checked={form["traffic.enabled"]}
+                onCheckedChange={(v) => set("traffic.enabled", v)}
+              />
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <Field
+            id="t-wait"
+            label="排队最大等待（毫秒）"
+            hint="并发满时等待槽位释放，0 关闭排队"
+            value={form["traffic.burstQueueWaitMs"]}
+            onChange={(v) => set("traffic.burstQueueWaitMs", v)}
+          />
+          <Field
+            id="t-qsize"
+            label="排队队列上限"
+            hint="超出后直接返回限流，防止请求堆积"
+            value={form["traffic.burstQueueMaxSize"]}
+            onChange={(v) => set("traffic.burstQueueMaxSize", v)}
+          />
+          <Field
+            id="t-window"
+            label="斜率统计窗口（秒）"
+            hint="0 关闭斜率保护，推荐 60～180 秒"
+            value={form["traffic.slopeWindowSec"]}
+            onChange={(v) => set("traffic.slopeWindowSec", v)}
+          />
+          <Field
+            id="t-ratio"
+            label="允许周期增长比例"
+            hint="如 0.5 表示最多比上周期多 50%"
+            value={form["traffic.slopeMaxGrowthRatio"]}
+            onChange={(v) => set("traffic.slopeMaxGrowthRatio", v)}
+          />
+          <Field
+            id="t-base"
+            label="触发基线最低请求数"
+            hint="上周期请求低于此值时不限流，防冷启动误杀"
+            value={form["traffic.slopeMinBaseline"]}
+            onChange={(v) => set("traffic.slopeMinBaseline", v)}
+          />
         </CardContent>
       </Card>
 

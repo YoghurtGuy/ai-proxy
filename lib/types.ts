@@ -18,6 +18,21 @@ export interface WeightSettings {
   topK: number;
 }
 
+export interface TrafficSettings {
+  /** 是否启用突发流量处理与斜率保护 */
+  enabled: boolean;
+  /** 并发满时排队等待最大毫秒数，0 表示不排队直接拒绝 */
+  burstQueueWaitMs: number;
+  /** 排队队列上限（超出直接拒绝，防止内存堆积） */
+  burstQueueMaxSize: number;
+  /** 斜率保护统计窗口（秒），0 表示关闭斜率保护 */
+  slopeWindowSec: number;
+  /** 斜率保护：允许的周期增长比例（例如 0.5 表示 50%） */
+  slopeMaxGrowthRatio: number;
+  /** 斜率保护：上一窗口最小基线请求数（低于此值不做斜率限制） */
+  slopeMinBaseline: number;
+}
+
 export interface Settings {
   /** 套餐额度轮询间隔（秒），0 关闭 */
   quotaPollSec: number;
@@ -32,6 +47,7 @@ export interface Settings {
   /** 明细日志保留天数 */
   logRetentionDays: number;
   weights: WeightSettings;
+  traffic: TrafficSettings;
 }
 
 export type QuotaProvider = "volcengine-afp";
@@ -149,6 +165,14 @@ export const DEFAULT_SETTINGS: Settings = {
   maxAttempts: 3,
   logRetentionDays: 14,
   weights: { priority: 1, load: 1, quota: 1.5, errorRate: 0.8, topK: 3 },
+  traffic: {
+    enabled: true,
+    burstQueueWaitMs: 3000,
+    burstQueueMaxSize: 50,
+    slopeWindowSec: 60,
+    slopeMaxGrowthRatio: 0.5,
+    slopeMinBaseline: 20,
+  },
 };
 
 export const DEFAULT_KEY_LIMITS: KeyLimits = {
@@ -229,6 +253,7 @@ function normalizeBaseUrl(raw: string, where: string): string {
 export function normalizeSettings(raw: unknown): Settings {
   const o = raw ? asObject(raw, "settings") : {};
   const w = o.weights ? asObject(o.weights, "settings.weights") : {};
+  const t = o.traffic ? asObject(o.traffic, "settings.traffic") : {};
   const d = DEFAULT_SETTINGS;
   return {
     quotaPollSec: asNumber(o.quotaPollSec, "settings.quotaPollSec", d.quotaPollSec, 0, 86400),
@@ -243,6 +268,28 @@ export function normalizeSettings(raw: unknown): Settings {
       quota: asNumber(w.quota, "settings.weights.quota", d.weights.quota, 0, 100),
       errorRate: asNumber(w.errorRate, "settings.weights.errorRate", d.weights.errorRate, 0, 100),
       topK: Math.round(asNumber(w.topK, "settings.weights.topK", d.weights.topK, 1, 20)),
+    },
+    traffic: {
+      enabled: asBool(t.enabled, "settings.traffic.enabled", d.traffic.enabled),
+      burstQueueWaitMs: Math.round(
+        asNumber(t.burstQueueWaitMs, "settings.traffic.burstQueueWaitMs", d.traffic.burstQueueWaitMs, 0, 60_000),
+      ),
+      burstQueueMaxSize: Math.round(
+        asNumber(t.burstQueueMaxSize, "settings.traffic.burstQueueMaxSize", d.traffic.burstQueueMaxSize, 0, 10_000),
+      ),
+      slopeWindowSec: Math.round(
+        asNumber(t.slopeWindowSec, "settings.traffic.slopeWindowSec", d.traffic.slopeWindowSec, 0, 3600),
+      ),
+      slopeMaxGrowthRatio: asNumber(
+        t.slopeMaxGrowthRatio,
+        "settings.traffic.slopeMaxGrowthRatio",
+        d.traffic.slopeMaxGrowthRatio,
+        0,
+        100,
+      ),
+      slopeMinBaseline: Math.round(
+        asNumber(t.slopeMinBaseline, "settings.traffic.slopeMinBaseline", d.traffic.slopeMinBaseline, 1, 1_000_000),
+      ),
     },
   };
 }

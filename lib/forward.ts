@@ -8,6 +8,7 @@ import {
   markSuccess,
   releaseUpstream,
   selectAndAcquire,
+  waitForUpstreamSlot,
 } from "./scheduler";
 import { recordRequest, usedToday } from "./stats";
 import { getConfig } from "./store";
@@ -192,6 +193,8 @@ function reasonMessage(reason: string): string {
       return "所有上游并发已满，请稍后重试";
     case "quota_exhausted":
       return "所有上游套餐额度已用尽";
+    case "all_slope_limited":
+      return "该模型所有上游均触发斜率保护，请放缓增速后重试";
     default:
       return "没有可用的上游";
   }
@@ -297,12 +300,26 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
   let lastError = "";
   let lastStatus = 503;
   let lastUpId = "";
+  let slopeRetryAfterSec: number | undefined;
 
   for (let attempt = 0; attempt < settings.maxAttempts; attempt++) {
-    const picked = selectAndAcquire(config, model, hash, excluded);
+    let picked = selectAndAcquire(config, model, hash, excluded);
+    if (!picked.up && picked.reason === "all_busy" && settings.traffic.enabled && settings.traffic.burstQueueWaitMs > 0) {
+      const deadline = Date.now() + settings.traffic.burstQueueWaitMs;
+      while (!picked.up && picked.reason === "all_busy" && Date.now() < deadline && !req.signal.aborted) {
+        const woken = await waitForUpstreamSlot(model, settings.traffic, req.signal);
+        if (!woken) break;
+        picked = selectAndAcquire(config, model, hash, excluded);
+      }
+    }
     if (!picked.up) {
       lastError = reasonMessage(picked.reason);
-      lastStatus = picked.reason === "all_cooling" || picked.reason === "quota_exhausted" ? 429 : 503;
+      if (picked.reason === "all_slope_limited") {
+        lastStatus = 429;
+        slopeRetryAfterSec = picked.retryAfterSec;
+      } else {
+        lastStatus = picked.reason === "all_cooling" || picked.reason === "quota_exhausted" ? 429 : 503;
+      }
       break;
     }
 
@@ -335,7 +352,12 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
       if (upstreamRes.status === 401 || upstreamRes.status === 403) {
         markCooldown(up.id, 60 * 60_000, `HTTP ${upstreamRes.status} 疑似密钥失效`);
       } else if (upstreamRes.status === 429) {
-        markCooldown(up.id, parseCooldownMs(upstreamRes.headers, text, settings), "429 限流");
+        const isBurst = /RequestBurstTooFast|ServerOverloaded/i.test(text);
+        markCooldown(
+          up.id,
+          parseCooldownMs(upstreamRes.headers, text, settings),
+          isBurst ? "429 突发流量保护" : "429 限流",
+        );
       } else if (upstreamRes.status >= 500) {
         markCooldown(up.id, backoffMs(fails, settings), `HTTP ${upstreamRes.status}`);
       }
@@ -384,5 +406,8 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
 
   releaseKeyOnce();
   record(lastUpId, lastStatus, { pt: 0, ct: 0, exact: false }, 0, settings.maxAttempts, lastError);
+  if (slopeRetryAfterSec !== undefined) {
+    return jsonError(429, lastError, "slope_limited", { "retry-after": String(slopeRetryAfterSec) });
+  }
   return jsonError(lastStatus === 429 ? 429 : 502, lastError || "所有上游都失败了", "upstream_failed");
 }

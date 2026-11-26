@@ -1,4 +1,4 @@
-import type { Config, DownstreamKey, QuotaSnapshot, Upstream } from "./types";
+import type { Config, DownstreamKey, QuotaSnapshot, TrafficSettings, Upstream } from "./types";
 import { modelAllowed } from "./types";
 
 /**
@@ -20,6 +20,8 @@ export interface UpstreamState {
   lastStatus: number;
   lastLatencyMs: number;
   quota: QuotaSnapshot | null;
+  /** 最近一次选号时记录的支持模型列表，用于精准唤醒同模型等待队列 */
+  models?: string[];
 }
 
 export interface KeyState {
@@ -28,10 +30,22 @@ export interface KeyState {
   hits: number[];
 }
 
+export interface SlopeState {
+  bucket: number;
+  count: number;
+  prevCount: number;
+}
+
+type Waiter = {
+  resolve: (acquired: boolean) => void;
+};
+
 type Runtime = {
   upstreams: Map<string, UpstreamState>;
   keys: Map<string, KeyState>;
   sticky: Map<string, { upId: string; at: number }>;
+  slope: Map<string, SlopeState>;
+  modelWaiters: Map<string, Waiter[]>;
 };
 
 const g = globalThis as unknown as { __aiProxyRuntime?: Runtime };
@@ -39,7 +53,12 @@ const runtime: Runtime = (g.__aiProxyRuntime ??= {
   upstreams: new Map(),
   keys: new Map(),
   sticky: new Map(),
+  slope: new Map(),
+  modelWaiters: new Map(),
 });
+// 兼容热更新或旧全局对象：确保新增字段存在
+runtime.slope ??= new Map();
+runtime.modelWaiters ??= new Map();
 
 const STICKY_MAX_ENTRIES = 50_000;
 
@@ -188,12 +207,145 @@ export function keyInflight(keyId: string): number {
 }
 
 // ---------------------------------------------------------------------------
+// 上游突发流量排队与「上游 × 模型」斜率保护
+// ---------------------------------------------------------------------------
+
+function enqueueWaiter(queue: Waiter[], maxSize: number, waitMs: number, signal?: AbortSignal): Promise<boolean> {
+  if (waitMs <= 0 || maxSize <= 0 || queue.length >= maxSize || signal?.aborted) {
+    return Promise.resolve(false);
+  }
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const waiter: Waiter = {
+      resolve: (acquired) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(acquired);
+      },
+    };
+    const removeFromQueue = () => {
+      const idx = queue.indexOf(waiter);
+      if (idx !== -1) queue.splice(idx, 1);
+    };
+    const onAbort = () => {
+      removeFromQueue();
+      waiter.resolve(false);
+    };
+    const timer = setTimeout(() => {
+      removeFromQueue();
+      waiter.resolve(false);
+    }, waitMs);
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+    queue.push(waiter);
+  });
+}
+
+function notifyNextWaiter(queue: Waiter[]): boolean {
+  const next = queue.shift();
+  if (!next) return false;
+  next.resolve(true);
+  return true;
+}
+
+/** 按请求模型进入上游并发等待队列。 */
+export function waitForUpstreamSlot(
+  model: string,
+  traffic: TrafficSettings,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!traffic.enabled) return Promise.resolve(false);
+  const key = model || "_global";
+  let queue = runtime.modelWaiters.get(key);
+  if (!queue) {
+    queue = [];
+    runtime.modelWaiters.set(key, queue);
+  }
+  return enqueueWaiter(queue, traffic.burstQueueMaxSize, traffic.burstQueueWaitMs, signal);
+}
+
+export type SlopeCheckResult =
+  | { allowed: true }
+  | { allowed: false; retryAfterSec: number; currentCount: number; prevCount: number; maxAllowed: number };
+
+export function slopeScope(upId: string, model: string): string {
+  return `upstream:${upId}:model:${model || "_global"}`;
+}
+
+function syncSlopeBucket(scope: string, windowMs: number, now: number): SlopeState {
+  const bucket = Math.floor(now / windowMs);
+  let s = runtime.slope.get(scope);
+  if (!s) {
+    s = { bucket, count: 0, prevCount: 0 };
+    runtime.slope.set(scope, s);
+    return s;
+  }
+  if (bucket > s.bucket) {
+    s.prevCount = bucket === s.bucket + 1 ? s.count : 0;
+    s.count = 0;
+    s.bucket = bucket;
+  }
+  return s;
+}
+
+/** 只读检查斜率是否超限（不递增计数），用于选号阶段过滤候选上游。 */
+export function peekSlopeLimit(
+  scope: string,
+  traffic: TrafficSettings,
+  now = Date.now(),
+): SlopeCheckResult {
+  if (!traffic.enabled || traffic.slopeWindowSec <= 0) return { allowed: true };
+  const windowMs = traffic.slopeWindowSec * 1000;
+  const s = syncSlopeBucket(scope, windowMs, now);
+  if (s.prevCount >= traffic.slopeMinBaseline) {
+    const maxAllowed = Math.ceil(s.prevCount * (1 + traffic.slopeMaxGrowthRatio));
+    if (s.count >= maxAllowed) {
+      const retryAfterMs = (s.bucket + 1) * windowMs - now;
+      return {
+        allowed: false,
+        retryAfterSec: Math.max(1, Math.ceil(retryAfterMs / 1000)),
+        currentCount: s.count,
+        prevCount: s.prevCount,
+        maxAllowed,
+      };
+    }
+  }
+  return { allowed: true };
+}
+
+/** 选定上游后记录一次斜率窗口计数；也可作为独立检查+计数使用。 */
+export function checkSlopeLimit(
+  scope: string,
+  traffic: TrafficSettings,
+  now = Date.now(),
+): SlopeCheckResult {
+  const res = peekSlopeLimit(scope, traffic, now);
+  if (!res.allowed) return res;
+  if (traffic.enabled && traffic.slopeWindowSec > 0) {
+    const s = syncSlopeBucket(scope, traffic.slopeWindowSec * 1000, now);
+    s.count += 1;
+  }
+  return { allowed: true };
+}
+
+export function resetSlopeState(scope?: string): void {
+  if (scope) runtime.slope.delete(scope);
+  else runtime.slope.clear();
+}
+
+// ---------------------------------------------------------------------------
 // 选号
 // ---------------------------------------------------------------------------
 
 export type PickResult =
   | { up: Upstream; state: UpstreamState; stickyHit: boolean }
-  | { up: null; reason: "no_upstream" | "no_model" | "all_cooling" | "all_busy" | "quota_exhausted" };
+  | {
+      up: null;
+      reason: "no_upstream" | "no_model" | "all_cooling" | "all_busy" | "quota_exhausted" | "all_slope_limited";
+      retryAfterSec?: number;
+    };
 
 function quotaBlocks(up: Upstream, s: UpstreamState): boolean {
   if (!up.quota || !s.quota) return false;
@@ -229,7 +381,7 @@ export function selectAndAcquire(
   exclude: ReadonlySet<string> = new Set(),
   now = Date.now(),
 ): PickResult {
-  const { weights, stickyTtlMin } = config.settings;
+  const { weights, stickyTtlMin, traffic } = config.settings;
   const stickyUpId = stickyGet(sessionHash, stickyTtlMin, now);
 
   const enabled = config.upstreams.filter((u) => u.enabled && !exclude.has(u.id));
@@ -240,11 +392,25 @@ export function selectAndAcquire(
   const forModel = enabled.filter((u) => modelAllowed(u.models, model));
   if (forModel.length === 0) return { up: null, reason: "no_model" };
 
+  for (const u of forModel) {
+    upState(u.id).models = u.models;
+  }
+
+  let minSlopeRetrySec = Infinity;
   const available = forModel.filter((u) => {
     const s = upState(u.id);
-    return s.cooldownUntil <= now && !quotaBlocks(u, s) && s.inflight < u.concurrency;
+    if (s.cooldownUntil > now || quotaBlocks(u, s) || s.inflight >= u.concurrency) return false;
+    const slope = peekSlopeLimit(slopeScope(u.id, model), traffic, now);
+    if (!slope.allowed) {
+      minSlopeRetrySec = Math.min(minSlopeRetrySec, slope.retryAfterSec);
+      return false;
+    }
+    return true;
   });
   if (available.length === 0) {
+    if (Number.isFinite(minSlopeRetrySec)) {
+      return { up: null, reason: "all_slope_limited", retryAfterSec: minSlopeRetrySec };
+    }
     const anyCooling = forModel.some((u) => upState(u.id).cooldownUntil > now);
     const anyQuota = forModel.some((u) => quotaBlocks(u, upState(u.id)));
     if (anyCooling || anyQuota) return { up: null, reason: anyQuota ? "quota_exhausted" : "all_cooling" };
@@ -257,12 +423,13 @@ export function selectAndAcquire(
 
   // 粘性会话是确定性优先，不参与加权抽签：同一对话必须落在同一上游，
   // 否则上游的 KV cache 全废，这一步比均衡更重要。
-  // 粘性上游冷却、并发满、额度见底时已经不在 available 里，自然就退出了。
+  // 粘性上游冷却、并发满、额度见底或触及斜率上限时已经不在 available 里，自然就退出了。
   if (stickyUpId) {
     const stickyCandidate = available.find((u) => u.id === stickyUpId);
     if (stickyCandidate) {
       const s = upState(stickyCandidate.id);
       s.inflight += 1;
+      checkSlopeLimit(slopeScope(stickyCandidate.id, model), traffic, now);
       stickySet(sessionHash, stickyCandidate.id, now);
       return { up: stickyCandidate, state: s, stickyHit: true };
     }
@@ -285,6 +452,7 @@ export function selectAndAcquire(
   const chosen = weightedPick(scored.slice(0, topK));
 
   chosen.state.inflight += 1;
+  checkSlopeLimit(slopeScope(chosen.up.id, model), traffic, now);
   if (sessionHash) stickySet(sessionHash, chosen.up.id, now);
   return { up: chosen.up, state: chosen.state, stickyHit: false };
 }
@@ -292,6 +460,20 @@ export function selectAndAcquire(
 export function releaseUpstream(upId: string): void {
   const s = runtime.upstreams.get(upId);
   if (s) s.inflight = Math.max(0, s.inflight - 1);
+  if (runtime.modelWaiters.size === 0) return;
+
+  const supported = s?.models;
+  for (const [modelKey, queue] of runtime.modelWaiters) {
+    if (queue.length === 0) {
+      runtime.modelWaiters.delete(modelKey);
+      continue;
+    }
+    if (!supported || modelAllowed(supported, modelKey)) {
+      notifyNextWaiter(queue);
+      if (queue.length === 0) runtime.modelWaiters.delete(modelKey);
+      break;
+    }
+  }
 }
 
 /** 给管理端用的运行时快照。 */

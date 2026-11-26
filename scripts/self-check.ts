@@ -654,15 +654,26 @@ check("normalizeSettings 自动补全并校验 trace 配置", () => {
   const def = normalizeConfig({}).settings.trace;
   assert.equal(def.enabled, true);
   assert.equal(def.maxBodyKb, 128);
-  const clamped = normalizeConfig({ settings: { trace: { enabled: false, maxBodyKb: 99999 } } }).settings.trace;
+  assert.equal(def.redactBase64, false);
+  const clamped = normalizeConfig({
+    settings: { trace: { enabled: false, maxBodyKb: 99999, redactBase64: true } },
+  }).settings.trace;
   assert.equal(clamped.enabled, false);
-  assert.equal(clamped.maxBodyKb, 2048);
+  assert.equal(clamped.maxBodyKb, 16384);
+  assert.equal(clamped.redactBase64, true);
 });
 
-check("prepareTraceBody 脱敏超长 Base64 并按 UTF-8 字节截断", () => {
+check("prepareTraceBody 按开关脱敏 Base64 并按 UTF-8 字节截断", () => {
   const b64 = "A".repeat(300);
   const raw = JSON.stringify({ url: `data:image/png;base64,${b64}`, text: "你好世界abcdef" });
-  const sanitized = prepareTraceBody(raw, 1024);
+
+  // 默认关闭脱敏：保留原始 Base64
+  const kept = prepareTraceBody(raw, 1024);
+  assert.equal(kept.truncated, false);
+  assert.equal(kept.text.includes(b64), true);
+
+  // 开启脱敏：替换为占位符
+  const sanitized = prepareTraceBody(raw, 1024, true);
   assert.equal(sanitized.truncated, false);
   assert.match(sanitized.text, /\[base64 omitted: \d+ chars\]/);
   assert.equal(sanitized.text.includes(b64), false);

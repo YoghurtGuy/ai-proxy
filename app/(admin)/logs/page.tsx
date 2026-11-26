@@ -31,26 +31,55 @@ interface LogDetail {
 interface ParsedMessage {
   role: string;
   text: string;
+  images: string[];
+}
+
+function isPreviewableImageUrl(url: unknown): url is string {
+  return typeof url === "string" && (/^data:image\//i.test(url) || /^https?:\/\//i.test(url));
+}
+
+function extractMessageParts(content: unknown): { text: string; images: string[] } {
+  if (typeof content === "string") return { text: content, images: [] };
+  if (!Array.isArray(content)) {
+    return { text: content == null ? "" : JSON.stringify(content, null, 2), images: [] };
+  }
+  const texts: string[] = [];
+  const images: string[] = [];
+  for (const part of content) {
+    if (typeof part === "string") {
+      if (part) texts.push(part);
+      continue;
+    }
+    if (part && typeof part === "object") {
+      const p = part as Record<string, unknown>;
+      if (typeof p.text === "string" && p.text) {
+        texts.push(p.text);
+        continue;
+      }
+      if (p.type === "image_url") {
+        const imgUrl =
+          typeof p.image_url === "string"
+            ? p.image_url
+            : p.image_url && typeof p.image_url === "object"
+              ? (p.image_url as Record<string, unknown>).url
+              : undefined;
+        if (isPreviewableImageUrl(imgUrl)) {
+          images.push(imgUrl);
+        } else if (typeof imgUrl === "string" && imgUrl) {
+          texts.push(`[图片: ${imgUrl}]`);
+        } else {
+          texts.push("[图片]");
+        }
+        continue;
+      }
+      texts.push(JSON.stringify(p));
+    }
+  }
+  return { text: texts.join("\n"), images };
 }
 
 function extractPartText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) {
-    return content == null ? "" : JSON.stringify(content, null, 2);
-  }
-  return content
-    .map((part) => {
-      if (typeof part === "string") return part;
-      if (part && typeof part === "object") {
-        const p = part as Record<string, unknown>;
-        if (typeof p.text === "string") return p.text;
-        if (p.type === "image_url") return "[图片]";
-        return JSON.stringify(p);
-      }
-      return "";
-    })
-    .filter(Boolean)
-    .join("\n");
+  return extractMessageParts(content).text;
 }
 
 function parseInputMessages(raw: string | null): ParsedMessage[] | null {
@@ -60,17 +89,19 @@ function parseInputMessages(raw: string | null): ParsedMessage[] | null {
     if (Array.isArray(obj.messages)) {
       return obj.messages.map((m) => {
         const msg = (m ?? {}) as Record<string, unknown>;
+        const parts = extractMessageParts(msg.content);
         return {
           role: typeof msg.role === "string" ? msg.role : "unknown",
-          text: extractPartText(msg.content),
+          text: parts.text,
+          images: parts.images,
         };
       });
     }
     if (typeof obj.prompt === "string") {
-      return [{ role: "prompt", text: obj.prompt }];
+      return [{ role: "prompt", text: obj.prompt, images: [] }];
     }
     if (typeof obj.input === "string") {
-      return [{ role: "input", text: obj.input }];
+      return [{ role: "input", text: obj.input, images: [] }];
     }
     return null;
   } catch {
@@ -401,7 +432,24 @@ export default function LogsPage() {
                       {parsedInput.map((m, i) => (
                         <div key={i} className="rounded bg-muted/50 p-2.5">
                           <div className="mb-1 text-[11px] font-semibold uppercase text-muted-foreground">{m.role}</div>
-                          <pre className="font-sans text-xs whitespace-pre-wrap break-words">{m.text || "—"}</pre>
+                          {m.text ? (
+                            <pre className="font-sans text-xs whitespace-pre-wrap break-words">{m.text}</pre>
+                          ) : m.images.length === 0 ? (
+                            <span className="text-xs text-muted-foreground">—</span>
+                          ) : null}
+                          {m.images.length > 0 ? (
+                            <div className="mt-2 flex flex-wrap gap-2">
+                              {m.images.map((src, imgIdx) => (
+                                // eslint-disable-next-line @next/next/no-img-element
+                                <img
+                                  key={imgIdx}
+                                  src={src}
+                                  alt={`输入图片 ${imgIdx + 1}`}
+                                  className="max-h-48 max-w-full rounded border bg-background object-contain"
+                                />
+                              ))}
+                            </div>
+                          ) : null}
                         </div>
                       ))}
                     </div>

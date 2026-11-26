@@ -32,6 +32,7 @@ type NumericKey =
 type Form = Record<NumericKey, string> & {
   "traffic.enabled": boolean;
   "trace.enabled": boolean;
+  "trace.redactBase64": boolean;
 };
 
 function toForm(settings: Settings): Form {
@@ -55,6 +56,7 @@ function toForm(settings: Settings): Form {
     "traffic.slopeMinBaseline": String(settings.traffic.slopeMinBaseline),
     "trace.enabled": settings.trace.enabled,
     "trace.maxBodyKb": String(settings.trace.maxBodyKb),
+    "trace.redactBase64": settings.trace.redactBase64,
   };
 }
 
@@ -85,6 +87,7 @@ function payloadOf(form: Form): Settings {
     trace: {
       enabled: form["trace.enabled"],
       maxBodyKb: n("trace.maxBodyKb"),
+      redactBase64: form["trace.redactBase64"],
     },
   };
 }
@@ -309,10 +312,23 @@ export default function SettingsPage() {
           <Field
             id="trace-kb"
             label="单条正文截断上限（KB）"
-            hint="输入与输出各自限制（4～2048 KB），超长自动截断，Base64 图片自动脱敏"
+            hint="输入与输出各自限制（4～16384 KB），保留 Base64 原图时建议按需调大"
             value={form["trace.maxBodyKb"]}
             onChange={(v) => set("trace.maxBodyKb", v)}
           />
+          <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
+            <div className="flex flex-col gap-0.5">
+              <Label htmlFor="trace-redact">Base64 媒体脱敏</Label>
+              <span className="text-xs text-muted-foreground">
+                开启后将超长 data:*;base64 内容替换为占位符；内部使用建议关闭以保留原图
+              </span>
+            </div>
+            <Switch
+              id="trace-redact"
+              checked={form["trace.redactBase64"]}
+              onCheckedChange={(v) => set("trace.redactBase64", v)}
+            />
+          </div>
         </CardContent>
       </Card>
 

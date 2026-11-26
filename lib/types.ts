@@ -38,6 +38,8 @@ export interface TraceSettings {
   enabled: boolean;
   /** 单条输入或输出正文最大保留大小（KB） */
   maxBodyKb: number;
+  /** 是否对超长 Base64 媒体内容脱敏替换（关闭则保留原图） */
+  redactBase64: boolean;
 }
 
 export interface Settings {
@@ -198,6 +200,7 @@ export const DEFAULT_SETTINGS: Settings = {
   trace: {
     enabled: true,
     maxBodyKb: 128,
+    redactBase64: false,
   },
 };
 
@@ -328,7 +331,8 @@ export function normalizeSettings(raw: unknown): Settings {
     },
     trace: {
       enabled: asBool(tr.enabled, "settings.trace.enabled", d.trace.enabled),
-      maxBodyKb: Math.round(asNumber(tr.maxBodyKb, "settings.trace.maxBodyKb", d.trace.maxBodyKb, 4, 2048)),
+      maxBodyKb: Math.round(asNumber(tr.maxBodyKb, "settings.trace.maxBodyKb", d.trace.maxBodyKb, 4, 16384)),
+      redactBase64: asBool(tr.redactBase64, "settings.trace.redactBase64", d.trace.redactBase64),
     },
   };
 }

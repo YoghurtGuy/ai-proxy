@@ -283,9 +283,10 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
 
   const traceEnabled = settings.trace.enabled && isMysqlConfigured();
   const maxBodyBytes = settings.trace.maxBodyKb * 1024;
+  const redactBase64 = settings.trace.redactBase64;
   const buildTrace = (respText: string, respTruncated = false): TraceBodyInput | null => {
     if (!traceEnabled) return null;
-    const reqPrep = rawBody ? prepareTraceBody(rawBody, maxBodyBytes) : { text: "", truncated: false };
+    const reqPrep = rawBody ? prepareTraceBody(rawBody, maxBodyBytes, redactBase64) : { text: "", truncated: false };
     if (!reqPrep.text && !respText) return null;
     return { req: reqPrep.text, resp: respText, truncated: reqPrep.truncated || respTruncated };
   };
@@ -400,7 +401,7 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
       releaseUpstream(up.id);
       releaseKeyOnce();
       if (okStatus < 400) markSuccess(up.id, Date.now() - startedAt);
-      const respPrep = traceEnabled ? prepareTraceBody(text, maxBodyBytes) : null;
+      const respPrep = traceEnabled ? prepareTraceBody(text, maxBodyBytes, redactBase64) : null;
       record(
         up.id,
         okStatus,
@@ -439,7 +440,7 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
   }
 
   releaseKeyOnce();
-  const errPrep = traceEnabled && lastError ? prepareTraceBody(lastError, maxBodyBytes) : null;
+  const errPrep = traceEnabled && lastError ? prepareTraceBody(lastError, maxBodyBytes, redactBase64) : null;
   record(
     lastUpId,
     lastStatus,

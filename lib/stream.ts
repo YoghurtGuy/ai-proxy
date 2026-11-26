@@ -37,9 +37,11 @@ interface ToolCallAcc {
 
 const BASE64_DATA_URI_RE = /data:[a-z0-9.+-]+\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{256,}/gi;
 
-/** 脱敏超长 Base64 媒体内容，并按 UTF-8 字节上限安全截断。 */
-export function prepareTraceBody(raw: string, maxBytes: number): { text: string; truncated: boolean } {
-  const sanitized = raw.replace(BASE64_DATA_URI_RE, (m) => `[base64 omitted: ${m.length} chars]`);
+/** 按需脱敏超长 Base64 媒体内容，并按 UTF-8 字节上限安全截断。 */
+export function prepareTraceBody(raw: string, maxBytes: number, redactBase64 = false): { text: string; truncated: boolean } {
+  const sanitized = redactBase64
+    ? raw.replace(BASE64_DATA_URI_RE, (m) => `[base64 omitted: ${m.length} chars]`)
+    : raw;
   if (maxBytes <= 0) return { text: "", truncated: sanitized.length > 0 };
   const buf = Buffer.from(sanitized, "utf8");
   if (buf.length <= maxBytes) return { text: sanitized, truncated: false };

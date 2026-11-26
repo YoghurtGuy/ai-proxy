@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 import { lineScanner, prepareTraceBody } from "../lib/stream";
 import { generateLogId } from "../lib/mysql";
-import { parseCooldownMs, sessionHash } from "../lib/forward";
+import { handleProxy, parseCooldownMs, sessionHash, shouldFallbackFromFlex } from "../lib/forward";
 import {
   checkSlopeLimit,
   markCooldown,
@@ -25,6 +25,7 @@ import {
   calculateModelCost,
   canonicalModelName,
   findModelPricing,
+  isFlexWindowActive,
   mergeBuckets,
   normalizeConfig,
 } from "../lib/types";
@@ -764,6 +765,209 @@ check("mergeBuckets 正确累加用量与缓存命中", () => {
     ttftN: 3,
     msSum: 1200,
   });
+});
+
+// ---------------------------------------------------------------------------
+// 11. 低优模式（Flex）配置校验、时间窗与自动回退重试
+// ---------------------------------------------------------------------------
+
+check("normalizeSettings 补全并校验 flex 配置", () => {
+  const def = normalizeConfig({}).settings.flex;
+  assert.equal(def.enabled, false);
+  assert.equal(def.startTime, "00:00");
+  assert.equal(def.endTime, "08:00");
+  assert.equal(def.maxWaitTimeoutMs, 60_000);
+  assert.equal(def.fallbackToDefault, true);
+
+  const clamped = normalizeConfig({
+    settings: {
+      flex: {
+        enabled: true,
+        startTime: "22:30",
+        endTime: "07:00",
+        maxWaitTimeoutMs: 9_999_999,
+        fallbackToDefault: false,
+      },
+    },
+  }).settings.flex;
+  assert.equal(clamped.enabled, true);
+  assert.equal(clamped.startTime, "22:30");
+  assert.equal(clamped.endTime, "07:00");
+  assert.equal(clamped.maxWaitTimeoutMs, 1_200_000);
+  assert.equal(clamped.fallbackToDefault, false);
+
+  assert.throws(() => normalizeConfig({ settings: { flex: { startTime: "25:00" } } }));
+  assert.throws(() => normalizeConfig({ settings: { flex: { endTime: "abc" } } }));
+});
+
+check("normalizeUpstream 仅允许按量付费上游开启 flexEnabled", () => {
+  const cfg = normalizeConfig({
+    upstreams: [
+      up("payg", { flexEnabled: true, quota: null }),
+      up("plan", {
+        flexEnabled: true,
+        quota: { provider: "volcengine-afp", accessKey: "a", secretKey: "b", minRemainingPct: 5 },
+      }),
+    ],
+  });
+  assert.equal(cfg.upstreams[0].flexEnabled, true);
+  assert.equal(cfg.upstreams[1].flexEnabled, false);
+});
+
+check("isFlexWindowActive 覆盖关闭、日间、跨午夜与全天", () => {
+  const at = (h: number, m: number) => {
+    const d = new Date(2026, 10, 26, h, m, 0, 0);
+    return d.getTime();
+  };
+  assert.equal(
+    isFlexWindowActive({ enabled: false, startTime: "00:00", endTime: "23:59", maxWaitTimeoutMs: 0, fallbackToDefault: true }, at(12, 0)),
+    false,
+  );
+  // 日间窗口 09:00 ~ 18:00
+  const day = { enabled: true, startTime: "09:00", endTime: "18:00", maxWaitTimeoutMs: 0, fallbackToDefault: true };
+  assert.equal(isFlexWindowActive(day, at(8, 59)), false);
+  assert.equal(isFlexWindowActive(day, at(9, 0)), true);
+  assert.equal(isFlexWindowActive(day, at(17, 59)), true);
+  assert.equal(isFlexWindowActive(day, at(18, 0)), false);
+
+  // 跨午夜 22:00 ~ 08:00
+  const night = { enabled: true, startTime: "22:00", endTime: "08:00", maxWaitTimeoutMs: 0, fallbackToDefault: true };
+  assert.equal(isFlexWindowActive(night, at(21, 59)), false);
+  assert.equal(isFlexWindowActive(night, at(22, 0)), true);
+  assert.equal(isFlexWindowActive(night, at(2, 30)), true);
+  assert.equal(isFlexWindowActive(night, at(7, 59)), true);
+  assert.equal(isFlexWindowActive(night, at(8, 0)), false);
+
+  // 全天（起止相同或留空）
+  assert.equal(
+    isFlexWindowActive({ enabled: true, startTime: "00:00", endTime: "00:00", maxWaitTimeoutMs: 0, fallbackToDefault: true }, at(15, 0)),
+    true,
+  );
+  assert.equal(
+    isFlexWindowActive({ enabled: true, startTime: "", endTime: "", maxWaitTimeoutMs: 0, fallbackToDefault: true }, at(15, 0)),
+    true,
+  );
+});
+
+check("shouldFallbackFromFlex 准确识别可回退状态码", () => {
+  assert.equal(shouldFallbackFromFlex(429, "ServerOverloaded"), true);
+  assert.equal(shouldFallbackFromFlex(408, "timeout"), true);
+  assert.equal(shouldFallbackFromFlex(503, "overload"), true);
+  assert.equal(shouldFallbackFromFlex(500, ""), true);
+  assert.equal(shouldFallbackFromFlex(400, "InvalidParameter.UnsupportedParameter: service_tier"), true);
+  assert.equal(shouldFallbackFromFlex(401, "invalid key"), false);
+  assert.equal(shouldFallbackFromFlex(403, "forbidden"), false);
+  assert.equal(shouldFallbackFromFlex(404, "not found"), false);
+  assert.equal(shouldFallbackFromFlex(400, "missing messages"), false);
+});
+
+await checkAsync("handleProxy 自动注入 Flex 并在 429/408 时同上游回退重试一次", async () => {
+  const gStore = globalThis as unknown as { __aiProxyStore?: { config: unknown } };
+  const storeObj = gStore.__aiProxyStore;
+  assert.ok(storeObj);
+  const prevConfig = storeObj.config;
+  const prevFetch = globalThis.fetch;
+
+  const testCfg = normalizeConfig({
+    settings: {
+      maxAttempts: 2,
+      trace: { enabled: false, maxBodyKb: 128, redactBase64: false },
+      flex: {
+        enabled: true,
+        startTime: "00:00",
+        endTime: "00:00", // 全天生效
+        maxWaitTimeoutMs: 45_000,
+        fallbackToDefault: true,
+      },
+    },
+    upstreams: [
+      up("flex_payg", { flexEnabled: true, quota: null, concurrency: 10 }),
+    ],
+    keys: [
+      { id: "k_flex", name: "flex-test", key: "sk-flex-test", enabled: true },
+    ],
+  });
+
+  storeObj.config = testCfg;
+
+  try {
+    const calls: { headers: Record<string, string>; body: Record<string, unknown> }[] = [];
+    let mode: "ok" | "429_then_ok" | "408_then_ok" = "ok";
+
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const h = new Headers(init?.headers);
+      const headersObj: Record<string, string> = {};
+      h.forEach((v, k) => {
+        headersObj[k.toLowerCase()] = v;
+      });
+      const bodyObj = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      calls.push({ headers: headersObj, body: bodyObj });
+
+      if (mode === "429_then_ok" && calls.length === 1) {
+        return new Response('{"error":{"code":"ServerOverloaded"}}', { status: 429 });
+      }
+      if (mode === "408_then_ok" && calls.length === 1) {
+        return new Response('{"error":{"message":"wait timeout"}}', { status: 408 });
+      }
+      return Response.json({
+        id: "resp_1",
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+        choices: [{ message: { role: "assistant", content: "ok" } }],
+      });
+    }) as typeof fetch;
+
+    const mkReq = (extraBody: Record<string, unknown> = {}) =>
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer sk-flex-test" },
+        body: JSON.stringify({ model: "doubao-seed-2-1-lite-260915", messages: [{ role: "user", content: "hi" }], ...extraBody }),
+      });
+
+    // 1. 正常命中 Flex
+    mode = "ok";
+    calls.length = 0;
+    const res1 = await handleProxy(mkReq(), { path: "/chat/completions" });
+    assert.equal(res1.status, 200);
+    assert.equal(res1.headers.get("x-ai-proxy-service-tier"), "flex");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].body.service_tier, "flex");
+    assert.equal(calls[0].headers["x-ark-max-wait-timeout-ms"], "45000");
+
+    // 2. Flex 返回 429 → 同上游去掉 service_tier 和等待头重试一次，且不触发冷却
+    mode = "429_then_ok";
+    calls.length = 0;
+    const res2 = await handleProxy(mkReq(), { path: "/chat/completions" });
+    assert.equal(res2.status, 200);
+    assert.equal(res2.headers.get("x-ai-proxy-service-tier"), "default-fallback");
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].body.service_tier, "flex");
+    assert.equal(calls[0].headers["x-ark-max-wait-timeout-ms"], "45000");
+    assert.equal("service_tier" in calls[1].body, false);
+    assert.equal(calls[1].headers["x-ark-max-wait-timeout-ms"], undefined);
+    assert.equal(upState("flex_payg").cooldownUntil, 0);
+
+    // 3. Flex 返回 408 → 同上游回退重试一次成功
+    mode = "408_then_ok";
+    calls.length = 0;
+    const res3 = await handleProxy(mkReq(), { path: "/chat/completions" });
+    assert.equal(res3.status, 200);
+    assert.equal(res3.headers.get("x-ai-proxy-service-tier"), "default-fallback");
+    assert.equal(calls.length, 2);
+    assert.equal("service_tier" in calls[1].body, false);
+
+    // 4. 客户端显式传入 service_tier: "default" 时不覆盖
+    mode = "ok";
+    calls.length = 0;
+    const res4 = await handleProxy(mkReq({ service_tier: "default" }), { path: "/chat/completions" });
+    assert.equal(res4.status, 200);
+    assert.equal(res4.headers.get("x-ai-proxy-service-tier"), null);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].body.service_tier, "default");
+    assert.equal(calls[0].headers["x-ark-max-wait-timeout-ms"], undefined);
+  } finally {
+    globalThis.fetch = prevFetch;
+    storeObj.config = prevConfig;
+  }
 });
 
 console.log(`\n${passed} 项通过${process.exitCode ? "，有失败" : ""}`);

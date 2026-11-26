@@ -14,7 +14,7 @@ import { isMysqlConfigured, type TraceBodyInput } from "./mysql";
 import { recordRequest, usedToday } from "./stats";
 import { getConfig } from "./store";
 import { prepareTraceBody, tapStream, usageFromJsonBody, type UsageTotals } from "./stream";
-import { modelAllowed, type Config, type DownstreamKey, type Settings, type Upstream } from "./types";
+import { isFlexWindowActive, modelAllowed, type Config, type DownstreamKey, type Settings, type Upstream } from "./types";
 
 /**
  * 转发核心：鉴权 → 限流 → 选号 → 转发 → 失败换号 → 记账。
@@ -161,6 +161,13 @@ function shouldFailover(status: number): boolean {
   return status === 401 || status === 403 || status === 404 || status === 408 || status === 409 || status === 429 || status >= 500;
 }
 
+/** Flex 模式下遇到限流、过载、超时或不支持 service_tier 时，直接在同上游回退到常规模式重试。 */
+export function shouldFallbackFromFlex(status: number, bodyText: string): boolean {
+  if (status === 429 || status === 408 || status >= 500) return true;
+  if (status === 400 && /service_tier|flex/i.test(bodyText)) return true;
+  return false;
+}
+
 function upstreamUrl(up: Upstream, path: string): string {
   return `${up.baseUrl.replace(/\/+$/, "")}${path}`;
 }
@@ -174,13 +181,18 @@ function buildRequestHeaders(req: Request, up: Upstream): Headers {
   return headers;
 }
 
-function responseHeaders(up: Upstream, upstreamRes: Response): Headers {
+function responseHeaders(
+  up: Upstream,
+  upstreamRes: Response,
+  serviceTier?: "flex" | "default-fallback" | null,
+): Headers {
   const headers = new Headers();
   const contentType = upstreamRes.headers.get("content-type");
   if (contentType) headers.set("content-type", contentType);
   headers.set("cache-control", "no-cache, no-transform");
   headers.set("x-accel-buffering", "no");
   headers.set("x-ai-proxy-upstream", up.id);
+  if (serviceTier) headers.set("x-ai-proxy-service-tier", serviceTier);
   return headers;
 }
 
@@ -284,9 +296,9 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
   const traceEnabled = settings.trace.enabled && isMysqlConfigured();
   const maxBodyBytes = settings.trace.maxBodyKb * 1024;
   const redactBase64 = settings.trace.redactBase64;
-  const buildTrace = (respText: string, respTruncated = false): TraceBodyInput | null => {
+  const buildTrace = (respText: string, respTruncated = false, reqBodyText = rawBody): TraceBodyInput | null => {
     if (!traceEnabled) return null;
-    const reqPrep = rawBody ? prepareTraceBody(rawBody, maxBodyBytes, redactBase64) : { text: "", truncated: false };
+    const reqPrep = reqBodyText ? prepareTraceBody(reqBodyText, maxBodyBytes, redactBase64) : { text: "", truncated: false };
     if (!reqPrep.text && !respText) return null;
     return { req: reqPrep.text, resp: respText, truncated: reqPrep.truncated || respTruncated };
   };
@@ -324,6 +336,7 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
   let lastStatus = 503;
   let lastUpId = "";
   let slopeRetryAfterSec: number | undefined;
+  let flexFallbacks = 0;
 
   for (let attempt = 0; attempt < settings.maxAttempts; attempt++) {
     let picked = selectAndAcquire(config, model, hash, excluded);
@@ -349,28 +362,100 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
     const up = picked.up;
     lastUpId = up.id;
     const url = upstreamUrl(up, options.path);
-    const headers = buildRequestHeaders(req, up);
+    const hasBody = Boolean(rawBody && req.method !== "GET" && req.method !== "HEAD");
+    const canAutoFlex =
+      !up.quota &&
+      up.flexEnabled &&
+      isFlexWindowActive(settings.flex) &&
+      hasBody &&
+      parsedBody !== null &&
+      typeof parsedBody === "object" &&
+      !Array.isArray(parsedBody) &&
+      (parsedBody as Record<string, unknown>).service_tier === undefined;
 
-    let upstreamRes: Response;
-    try {
-      upstreamRes = await fetch(url, {
-        method: req.method,
-        headers,
-        body: rawBody && req.method !== "GET" && req.method !== "HEAD" ? rawBody : undefined,
-        signal: req.signal,
-      });
-    } catch (err) {
+    let sentBody = rawBody;
+    let usedTier: "flex" | "default-fallback" | null = null;
+    let upstreamRes: Response | null = null;
+    let prefetchedErrText: string | null = null;
+    let netErr: Error | null = null;
+    let needFallback = false;
+
+    if (canAutoFlex) {
+      const flexBody = JSON.stringify({ ...(parsedBody as Record<string, unknown>), service_tier: "flex" });
+      const flexHeaders = buildRequestHeaders(req, up);
+      if (settings.flex.maxWaitTimeoutMs > 0 && !flexHeaders.has("x-ark-max-wait-timeout-ms")) {
+        flexHeaders.set("X-Ark-Max-Wait-Timeout-Ms", String(settings.flex.maxWaitTimeoutMs));
+      }
+      const flexSignal =
+        settings.flex.maxWaitTimeoutMs > 0
+          ? AbortSignal.any([req.signal, AbortSignal.timeout(settings.flex.maxWaitTimeoutMs + 60_000)])
+          : req.signal;
+      try {
+        const res = await fetch(url, {
+          method: req.method,
+          headers: flexHeaders,
+          body: flexBody,
+          signal: flexSignal,
+        });
+        if (!res.ok) {
+          const errText = await res.text().catch(() => "");
+          if (settings.flex.fallbackToDefault && shouldFallbackFromFlex(res.status, errText)) {
+            needFallback = true;
+          } else {
+            upstreamRes = res;
+            prefetchedErrText = errText;
+          }
+        } else {
+          upstreamRes = res;
+          usedTier = "flex";
+          sentBody = flexBody;
+        }
+      } catch (err) {
+        if (req.signal.aborted) {
+          releaseUpstream(up.id);
+          lastStatus = 499;
+          lastError = "客户端取消请求";
+          break;
+        }
+        if (settings.flex.fallbackToDefault) {
+          needFallback = true;
+        } else {
+          netErr = err as Error;
+        }
+      }
+    }
+
+    if (!canAutoFlex || needFallback) {
+      if (needFallback) {
+        flexFallbacks += 1;
+        usedTier = "default-fallback";
+      }
+      sentBody = rawBody;
+      const headers = buildRequestHeaders(req, up);
+      try {
+        upstreamRes = await fetch(url, {
+          method: req.method,
+          headers,
+          body: hasBody ? rawBody : undefined,
+          signal: req.signal,
+        });
+      } catch (err) {
+        netErr = err as Error;
+      }
+    }
+
+    if (!upstreamRes) {
       const fails = markFailure(up.id, 0);
       markCooldown(up.id, backoffMs(fails, settings), "network");
       releaseUpstream(up.id);
       excluded.add(up.id);
       lastStatus = 502;
-      lastError = `上游网络错误: ${(err as Error).message}`;
+      lastError = `上游网络错误: ${netErr?.message ?? "未知错误"}`;
       continue;
     }
 
     if (shouldFailover(upstreamRes.status)) {
-      const text = await upstreamRes.text().catch(() => "");
+      const text = prefetchedErrText ?? (await upstreamRes.text().catch(() => ""));
       const fails = markFailure(up.id, upstreamRes.status);
       if (upstreamRes.status === 401 || upstreamRes.status === 403) {
         markCooldown(up.id, 60 * 60_000, `HTTP ${upstreamRes.status} 疑似密钥失效`);
@@ -392,11 +477,11 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
     }
 
     // 走到这里说明这次请求有结果了：成功或者是一个不该重试的 4xx。
-    const headersOut = responseHeaders(up, upstreamRes);
+    const headersOut = responseHeaders(up, upstreamRes, usedTier);
     const okStatus = upstreamRes.status;
 
-    if (!streamRequested || !upstreamRes.body) {
-      const text = await upstreamRes.text().catch(() => "");
+    if (!streamRequested || !upstreamRes.body || prefetchedErrText !== null) {
+      const text = prefetchedErrText ?? (await upstreamRes.text().catch(() => ""));
       const usage = okStatus < 400 ? usageFromJsonBody(text) : { pt: 0, ct: 0, exact: false };
       releaseUpstream(up.id);
       releaseKeyOnce();
@@ -407,9 +492,9 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
         okStatus,
         usage,
         0,
-        attempt,
+        attempt + flexFallbacks,
         okStatus >= 400 ? text.slice(0, 200) : null,
-        respPrep ? buildTrace(respPrep.text, respPrep.truncated) : null,
+        respPrep ? buildTrace(respPrep.text, respPrep.truncated, sentBody) : null,
       );
       return new Response(text, { status: okStatus, headers: headersOut });
     }
@@ -424,13 +509,15 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
         releaseUpstream(up.id);
         releaseKeyOnce();
         if (completed && okStatus < 400) markSuccess(up.id, Date.now() - startedAt);
-        const traceBody = traceEnabled ? buildTrace(captured ? JSON.stringify(captured) : "", Boolean(captured?.truncated)) : null;
+        const traceBody = traceEnabled
+          ? buildTrace(captured ? JSON.stringify(captured) : "", Boolean(captured?.truncated), sentBody)
+          : null;
         record(
           up.id,
           okStatus,
           usage,
           firstByteAt ? firstByteAt - startedAt : 0,
-          attempt,
+          attempt + flexFallbacks,
           completed ? null : "客户端提前断开",
           traceBody,
         );
@@ -446,7 +533,7 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
     lastStatus,
     { pt: 0, ct: 0, exact: false },
     0,
-    settings.maxAttempts,
+    settings.maxAttempts + flexFallbacks,
     lastError,
     traceEnabled ? buildTrace(errPrep?.text ?? "", Boolean(errPrep?.truncated)) : null,
   );

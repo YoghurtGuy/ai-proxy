@@ -42,6 +42,19 @@ export interface TraceSettings {
   redactBase64: boolean;
 }
 
+export interface FlexSettings {
+  /** 是否启用自动低优模式（flex） */
+  enabled: boolean;
+  /** 自动开启时间（本地时间 HH:mm，如 "00:00" 或 "22:00"）；留空或与结束时间相同表示全天生效 */
+  startTime: string;
+  /** 自动结束时间（本地时间 HH:mm，如 "08:00"）；支持跨午夜 */
+  endTime: string;
+  /** 传给火山方舟的 X-Ark-Max-Wait-Timeout-Ms（毫秒），0 表示不传，上限 1200000（20 分钟） */
+  maxWaitTimeoutMs: number;
+  /** 遇到 429 / 过载 / 超时时，是否在同一上游自动去掉 service_tier: "flex" 重试一次 */
+  fallbackToDefault: boolean;
+}
+
 export interface Settings {
   /** 套餐额度轮询间隔（秒），0 关闭 */
   quotaPollSec: number;
@@ -58,6 +71,7 @@ export interface Settings {
   weights: WeightSettings;
   traffic: TrafficSettings;
   trace: TraceSettings;
+  flex: FlexSettings;
 }
 
 export type QuotaProvider = "volcengine-afp";
@@ -85,6 +99,8 @@ export interface Upstream {
   /** 并发上限 */
   concurrency: number;
   enabled: boolean;
+  /** 仅按量计费上游有效：是否在 Flex 时段自动注入 service_tier: "flex" */
+  flexEnabled: boolean;
   quota: UpstreamQuota | null;
 }
 
@@ -202,6 +218,13 @@ export const DEFAULT_SETTINGS: Settings = {
     maxBodyKb: 128,
     redactBase64: false,
   },
+  flex: {
+    enabled: false,
+    startTime: "00:00",
+    endTime: "08:00",
+    maxWaitTimeoutMs: 60_000,
+    fallbackToDefault: true,
+  },
 };
 
 export const DEFAULT_KEY_LIMITS: KeyLimits = {
@@ -267,6 +290,20 @@ export function modelAllowed(allowed: string[], model: string): boolean {
   return allowed.includes(model);
 }
 
+/** 判断当前本地时间是否处于 Flex 自动开启窗口内（[startTime, endTime)，支持跨午夜；起止相同或留空视为全天）。 */
+export function isFlexWindowActive(flex: FlexSettings, now = Date.now()): boolean {
+  if (!flex.enabled) return false;
+  if (!flex.startTime || !flex.endTime || flex.startTime === flex.endTime) return true;
+  const [sh, sm] = flex.startTime.split(":").map(Number);
+  const [eh, em] = flex.endTime.split(":").map(Number);
+  const startMin = sh * 60 + sm;
+  const endMin = eh * 60 + em;
+  const d = new Date(now);
+  const curMin = d.getHours() * 60 + d.getMinutes();
+  if (startMin < endMin) return curMin >= startMin && curMin < endMin;
+  return curMin >= startMin || curMin < endMin;
+}
+
 // ---------------------------------------------------------------------------
 // 校验：config.json 是用户可以直接手改的，这里按信任边界处理。
 // ---------------------------------------------------------------------------
@@ -301,6 +338,15 @@ function asString(v: unknown, where: string, def = ""): string {
   return v;
 }
 
+function asTimeHHMM(v: unknown, where: string, def: string): string {
+  if (v === undefined || v === null) return def;
+  if (typeof v !== "string") fail(where, "应为字符串");
+  const trimmed = v.trim();
+  if (!trimmed) return "";
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(trimmed)) fail(where, "应为 HH:mm 格式，例如 22:00");
+  return trimmed;
+}
+
 function asStringArray(v: unknown, where: string, def: string[]): string[] {
   if (v === undefined || v === null) return def;
   if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) fail(where, "应为字符串数组");
@@ -324,6 +370,7 @@ export function normalizeSettings(raw: unknown): Settings {
   const w = o.weights ? asObject(o.weights, "settings.weights") : {};
   const t = o.traffic ? asObject(o.traffic, "settings.traffic") : {};
   const tr = o.trace ? asObject(o.trace, "settings.trace") : {};
+  const fl = o.flex ? asObject(o.flex, "settings.flex") : {};
   const d = DEFAULT_SETTINGS;
   return {
     quotaPollSec: asNumber(o.quotaPollSec, "settings.quotaPollSec", d.quotaPollSec, 0, 86400),
@@ -365,6 +412,15 @@ export function normalizeSettings(raw: unknown): Settings {
       enabled: asBool(tr.enabled, "settings.trace.enabled", d.trace.enabled),
       maxBodyKb: Math.round(asNumber(tr.maxBodyKb, "settings.trace.maxBodyKb", d.trace.maxBodyKb, 4, 16384)),
       redactBase64: asBool(tr.redactBase64, "settings.trace.redactBase64", d.trace.redactBase64),
+    },
+    flex: {
+      enabled: asBool(fl.enabled, "settings.flex.enabled", d.flex.enabled),
+      startTime: asTimeHHMM(fl.startTime, "settings.flex.startTime", d.flex.startTime),
+      endTime: asTimeHHMM(fl.endTime, "settings.flex.endTime", d.flex.endTime),
+      maxWaitTimeoutMs: Math.round(
+        asNumber(fl.maxWaitTimeoutMs, "settings.flex.maxWaitTimeoutMs", d.flex.maxWaitTimeoutMs, 0, 1_200_000),
+      ),
+      fallbackToDefault: asBool(fl.fallbackToDefault, "settings.flex.fallbackToDefault", d.flex.fallbackToDefault),
     },
   };
 }
@@ -412,6 +468,7 @@ export function normalizeUpstream(raw: unknown, index: number): Upstream {
     priority: asNumber(o.priority, `${where}.priority`, 50, 0, 1_000_000),
     concurrency: Math.round(asNumber(o.concurrency, `${where}.concurrency`, 8, 1, 10_000)),
     enabled: asBool(o.enabled, `${where}.enabled`, true),
+    flexEnabled: quota ? false : asBool(o.flexEnabled, `${where}.flexEnabled`, false),
     quota,
   };
 }

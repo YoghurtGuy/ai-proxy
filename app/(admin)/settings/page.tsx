@@ -27,12 +27,17 @@ type NumericKey =
   | "traffic.slopeWindowSec"
   | "traffic.slopeMaxGrowthRatio"
   | "traffic.slopeMinBaseline"
-  | "trace.maxBodyKb";
+  | "trace.maxBodyKb"
+  | "flex.maxWaitTimeoutMs";
 
 type Form = Record<NumericKey, string> & {
   "traffic.enabled": boolean;
   "trace.enabled": boolean;
   "trace.redactBase64": boolean;
+  "flex.enabled": boolean;
+  "flex.startTime": string;
+  "flex.endTime": string;
+  "flex.fallbackToDefault": boolean;
 };
 
 function toForm(settings: Settings): Form {
@@ -57,6 +62,11 @@ function toForm(settings: Settings): Form {
     "trace.enabled": settings.trace.enabled,
     "trace.maxBodyKb": String(settings.trace.maxBodyKb),
     "trace.redactBase64": settings.trace.redactBase64,
+    "flex.enabled": settings.flex.enabled,
+    "flex.startTime": settings.flex.startTime,
+    "flex.endTime": settings.flex.endTime,
+    "flex.maxWaitTimeoutMs": String(settings.flex.maxWaitTimeoutMs),
+    "flex.fallbackToDefault": settings.flex.fallbackToDefault,
   };
 }
 
@@ -88,6 +98,13 @@ function payloadOf(form: Form): Settings {
       enabled: form["trace.enabled"],
       maxBodyKb: n("trace.maxBodyKb"),
       redactBase64: form["trace.redactBase64"],
+    },
+    flex: {
+      enabled: form["flex.enabled"],
+      startTime: form["flex.startTime"].trim(),
+      endTime: form["flex.endTime"].trim(),
+      maxWaitTimeoutMs: n("flex.maxWaitTimeoutMs"),
+      fallbackToDefault: form["flex.fallbackToDefault"],
     },
   };
 }
@@ -288,6 +305,69 @@ export default function SettingsPage() {
             value={form["traffic.slopeMinBaseline"]}
             onChange={(v) => set("traffic.slopeMinBaseline", v)}
           />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <CardTitle>低优模式（Flex）</CardTitle>
+              <CardDescription>
+                在指定时间段内为开启了 Flex 的按量付费上游自动注入 service_tier: &quot;flex&quot;（输入输出半价）
+              </CardDescription>
+            </div>
+            <div className="flex items-center gap-2">
+              <Label htmlFor="flex-enabled">启用自动 Flex</Label>
+              <Switch
+                id="flex-enabled"
+                checked={form["flex.enabled"]}
+                onCheckedChange={(v) => set("flex.enabled", v)}
+              />
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="grid gap-4 sm:grid-cols-2">
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="flex-start">自动开启时间</Label>
+            <Input
+              id="flex-start"
+              type="time"
+              value={form["flex.startTime"]}
+              onChange={(e) => set("flex.startTime", e.target.value)}
+            />
+            <span className="text-xs text-muted-foreground">本地时间 HH:mm；与结束时间相同或留空则全天生效</span>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="flex-end">自动结束时间</Label>
+            <Input
+              id="flex-end"
+              type="time"
+              value={form["flex.endTime"]}
+              onChange={(e) => set("flex.endTime", e.target.value)}
+            />
+            <span className="text-xs text-muted-foreground">支持跨午夜，例如 22:00 ~ 08:00</span>
+          </div>
+          <Field
+            id="flex-wait"
+            label="排队等待超时（毫秒）"
+            hint="通过 X-Ark-Max-Wait-Timeout-Ms 传给火山方舟（0～1200000，0 不传）"
+            value={form["flex.maxWaitTimeoutMs"]}
+            onChange={(v) => set("flex.maxWaitTimeoutMs", v)}
+          />
+          <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
+            <div className="flex flex-col gap-0.5">
+              <Label htmlFor="flex-fallback">失败自动回退常规模式</Label>
+              <span className="text-xs text-muted-foreground">
+                遇到 429、过载、超时或不支持参数时，自动去掉 service_tier: &quot;flex&quot; 在同一上游重试一次
+              </span>
+            </div>
+            <Switch
+              id="flex-fallback"
+              checked={form["flex.fallbackToDefault"]}
+              onCheckedChange={(v) => set("flex.fallbackToDefault", v)}
+            />
+          </div>
         </CardContent>
       </Card>
 

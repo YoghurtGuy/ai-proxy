@@ -44,6 +44,7 @@ interface FormState {
   priority: string;
   concurrency: string;
   enabled: boolean;
+  flexEnabled: boolean;
   quotaEnabled: boolean;
   region: string;
   accessKey: string;
@@ -60,6 +61,7 @@ const EMPTY_FORM: FormState = {
   priority: "50",
   concurrency: "8",
   enabled: true,
+  flexEnabled: false,
   quotaEnabled: false,
   region: "cn-beijing",
   accessKey: "",
@@ -77,6 +79,7 @@ function toForm(up: UpstreamRow): FormState {
     priority: String(up.priority),
     concurrency: String(up.concurrency),
     enabled: up.enabled,
+    flexEnabled: Boolean(up.flexEnabled),
     quotaEnabled: Boolean(up.quota),
     region: up.quota?.region ?? "cn-beijing",
     accessKey: up.quota?.accessKey ?? "",
@@ -98,6 +101,7 @@ function payloadOf(form: FormState) {
     priority: Number(form.priority) || 50,
     concurrency: Number(form.concurrency) || 8,
     enabled: form.enabled,
+    flexEnabled: form.quotaEnabled ? false : form.flexEnabled,
     quota: form.quotaEnabled
       ? {
           provider: "volcengine-afp",
@@ -331,7 +335,10 @@ export default function UpstreamsPage() {
                             <span className="text-muted-foreground">待拉取</span>
                           )
                         ) : (
-                          <span className="text-muted-foreground">按量计费</span>
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-muted-foreground">按量计费</span>
+                            {up.flexEnabled ? <Badge variant="outline">Flex</Badge> : null}
+                          </div>
                         )}
                       </TableCell>
                       <TableCell className="pr-4">
@@ -461,8 +468,31 @@ export default function UpstreamsPage() {
                   需要 IAM AK/SK；按量计费上游请保持关闭
                 </span>
               </div>
-              <Switch id="up-quota" checked={form.quotaEnabled} onCheckedChange={(v) => set("quotaEnabled", v)} />
+              <Switch
+                id="up-quota"
+                checked={form.quotaEnabled}
+                onCheckedChange={(v) => {
+                  set("quotaEnabled", v);
+                  if (v) set("flexEnabled", false);
+                }}
+              />
             </div>
+
+            {!form.quotaEnabled ? (
+              <div className="flex items-center justify-between rounded-lg border p-3">
+                <div className="flex flex-col">
+                  <Label htmlFor="up-flex">开启低优模式（Flex）</Label>
+                  <span className="text-xs text-muted-foreground">
+                    仅按量付费上游可用；需同时在「设置 → 低优模式」启用且在生效时间段内
+                  </span>
+                </div>
+                <Switch
+                  id="up-flex"
+                  checked={form.flexEnabled}
+                  onCheckedChange={(v) => set("flexEnabled", v)}
+                />
+              </div>
+            ) : null}
 
             {form.quotaEnabled ? (
               <div className="flex flex-col gap-3 rounded-lg border p-3">

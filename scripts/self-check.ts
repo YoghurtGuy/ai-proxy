@@ -8,7 +8,8 @@
  * 3. SSE 分块里的 usage 提取
  */
 import assert from "node:assert/strict";
-import { lineScanner } from "../lib/stream";
+import { lineScanner, prepareTraceBody } from "../lib/stream";
+import { generateLogId } from "../lib/mysql";
 import { parseCooldownMs, sessionHash } from "../lib/forward";
 import {
   checkSlopeLimit,
@@ -20,7 +21,8 @@ import {
   upState,
   waitForUpstreamSlot,
 } from "../lib/scheduler";
-import { normalizeConfig } from "../lib/types";
+import { calculateModelCost, normalizeConfig } from "../lib/types";
+import { formatCost } from "../lib/format";
 import { authHint } from "../lib/hints";
 import { signRequest, fetchVolcengineQuota, listAgentPlanModels } from "../lib/quota/volcengine";
 
@@ -574,7 +576,10 @@ check("斜率保护按「上游 × 模型」隔离，超限后自动切到备用
     slopeMaxGrowthRatio: 0.5,
     slopeMinBaseline: 10,
   };
-  const cfg = mkConfig([up("sl_a", { priority: 1 }), up("sl_b", { priority: 50 })], { traffic });
+  const cfg = mkConfig([up("sl_a", { priority: 1 }), up("sl_b", { priority: 50 })], {
+    traffic,
+    weights: { topK: 1 },
+  });
   const w0 = Math.floor(Date.now() / 60_000) * 60_000 - 60_000;
   const w1 = w0 + 60_000;
 
@@ -601,6 +606,113 @@ check("斜率保护按「上游 × 模型」隔离，超限后自动切到备用
   assert.equal(blocked.up, null);
   assert.equal(blocked.reason, "all_slope_limited");
   if (!blocked.up) assert.ok((blocked.retryAfterSec ?? 0) >= 1);
+});
+
+// ---------------------------------------------------------------------------
+// 9. 模型定价、缓存命中提取与费用计算
+// ---------------------------------------------------------------------------
+
+check("usage 提取 cached_tokens 与 cache_read_input_tokens", () => {
+  const s1 = lineScanner();
+  s1.feed(
+    new TextEncoder().encode(
+      'data: {"usage":{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":600}}}\n\n',
+    ),
+  );
+  assert.deepEqual(s1.finish(), { pt: 1000, ct: 200, cachedPt: 600, exact: true });
+
+  const s2 = lineScanner();
+  s2.feed(
+    new TextEncoder().encode(
+      'data: {"usage":{"input_tokens":500,"output_tokens":100,"cache_read_input_tokens":300}}\n\n',
+    ),
+  );
+  assert.deepEqual(s2.finish(), { pt: 500, ct: 100, cachedPt: 300, exact: true });
+});
+
+check("normalizeModelPrices 与 calculateModelCost 精确扣减缓存命中", () => {
+  const cfg = normalizeConfig({
+    modelPrices: {
+      "doubao-seed-2.1-lite": { inputPerM: 0.8, cachedInputPerM: 0.16, outputPerM: 2.7 },
+    },
+  });
+  const pricing = cfg.modelPrices["doubao-seed-2.1-lite"];
+  assert.ok(pricing);
+  // 1M 总输入（含 500k 缓存命中 => 500k 常规输入 * 0.8 + 500k 缓存 * 0.16 = 0.4 + 0.08 = 0.48）+ 1M 输出 * 2.7 = 3.18
+  const cost = calculateModelCost(1_000_000, 1_000_000, 500_000, pricing);
+  assert.ok(Math.abs(cost - 3.18) < 1e-9);
+  assert.equal(calculateModelCost(1000, 1000, 0, null), 0);
+  assert.equal(formatCost(0.00123), "¥0.0012");
+  assert.equal(formatCost(3.18), "¥3.18");
+});
+
+// ---------------------------------------------------------------------------
+// 10. 正文捕获、脱敏截断与 MySQL ID 生成
+// ---------------------------------------------------------------------------
+
+check("normalizeSettings 自动补全并校验 trace 配置", () => {
+  const def = normalizeConfig({}).settings.trace;
+  assert.equal(def.enabled, true);
+  assert.equal(def.maxBodyKb, 128);
+  const clamped = normalizeConfig({ settings: { trace: { enabled: false, maxBodyKb: 99999 } } }).settings.trace;
+  assert.equal(clamped.enabled, false);
+  assert.equal(clamped.maxBodyKb, 2048);
+});
+
+check("prepareTraceBody 脱敏超长 Base64 并按 UTF-8 字节截断", () => {
+  const b64 = "A".repeat(300);
+  const raw = JSON.stringify({ url: `data:image/png;base64,${b64}`, text: "你好世界abcdef" });
+  const sanitized = prepareTraceBody(raw, 1024);
+  assert.equal(sanitized.truncated, false);
+  assert.match(sanitized.text, /\[base64 omitted: \d+ chars\]/);
+  assert.equal(sanitized.text.includes(b64), false);
+
+  const cut = prepareTraceBody("你好世界123456", 7);
+  assert.equal(cut.truncated, true);
+  assert.ok(Buffer.byteLength(cut.text, "utf8") <= 7);
+});
+
+check("lineScanner 流式正文合并（content/reasoning/tool_calls）与截断", () => {
+  const s = lineScanner(1024);
+  const enc = new TextEncoder();
+  s.feed(enc.encode('data: {"choices":[{"delta":{"reasoning_content":"先思"}}]}\n\n'));
+  s.feed(enc.encode('data: {"choices":[{"delta":{"reasoning_content":"考一下"}}]}\n\n'));
+  s.feed(enc.encode('data: {"choices":[{"delta":{"content":"你好"}}]}\n\n'));
+  s.feed(enc.encode('data: {"choices":[{"delta":{"content":"，世界"}}]}\n\n'));
+  s.feed(
+    enc.encode(
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":"}}]}}]}\n\n',
+    ),
+  );
+  s.feed(
+    enc.encode(
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"Beijing\\"}"}}]}}]}\n\n',
+    ),
+  );
+  s.feed(enc.encode('data: {"usage":{"prompt_tokens":10,"completion_tokens":20}}\n\n'));
+  assert.deepEqual(s.finish(), { pt: 10, ct: 20, exact: true });
+  assert.deepEqual(s.captured, {
+    content: "你好，世界",
+    reasoning: "先思考一下",
+    toolCalls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"Beijing"}' } }],
+    truncated: false,
+  });
+
+  const small = lineScanner(6);
+  small.feed(enc.encode('data: {"choices":[{"delta":{"content":"1234"}}]}\n\n'));
+  small.feed(enc.encode('data: {"choices":[{"delta":{"content":"5678"}}]}\n\n'));
+  small.feed(enc.encode('data: {"usage":{"prompt_tokens":5,"completion_tokens":8}}\n\n'));
+  assert.deepEqual(small.finish(), { pt: 5, ct: 8, exact: true });
+  assert.equal(small.captured?.content, "123456");
+  assert.equal(small.captured?.truncated, true);
+});
+
+check("generateLogId 生成 26 位按时间单调有序 ID", () => {
+  const a = generateLogId(1_700_000_000_000);
+  const b = generateLogId(1_700_000_001_000);
+  assert.equal(a.length, 26);
+  assert.equal(b.length, 26);
+  assert.ok(a.slice(0, 12) < b.slice(0, 12));
 });
 
 console.log(`\n${passed} 项通过${process.exitCode ? "，有失败" : ""}`);

@@ -1,5 +1,14 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import {
+  enqueueMysqlLog,
+  generateLogId,
+  initMysql,
+  isMysqlConfigured,
+  loadMysqlUsage,
+  upsertMysqlUsageBuckets,
+  type TraceBodyInput,
+} from "./mysql";
 import { LOG_DIR, USAGE_PATH, enqueue, writeJsonAtomic } from "./store";
 import { emptyBucket, type Bucket, type RequestLogLine, type UsageFile } from "./types";
 
@@ -22,6 +31,7 @@ type StatsState = {
   usage: UsageFile;
   loaded: boolean;
   dirty: boolean;
+  dirtyKeys: Set<string>;
   timer: ReturnType<typeof setTimeout> | null;
   /** 待写入的 JSONL 行，攒够或超时再一次性 append */
   pendingLines: string[];
@@ -34,11 +44,13 @@ const state: StatsState = (g.__aiProxyStats ??= {
   usage: { version: 1, days: {} },
   loaded: false,
   dirty: false,
+  dirtyKeys: new Set(),
   timer: null,
   pendingLines: [],
   pendingTimer: null,
   recent: new Map(),
 });
+state.dirtyKeys ??= new Set();
 
 export function localDateKey(d = new Date()): string {
   const y = d.getFullYear();
@@ -47,20 +59,49 @@ export function localDateKey(d = new Date()): string {
   return `${y}-${m}-${day}`;
 }
 
-/** 读取 usage.json 到内存。文件不存在就当作空。 */
-export async function loadUsage(): Promise<void> {
-  if (state.loaded) return;
+async function readLocalUsageFile(): Promise<Record<string, Record<string, Bucket>> | null> {
   try {
     const text = await fs.readFile(USAGE_PATH, "utf8");
     const parsed = JSON.parse(text) as UsageFile;
     if (parsed && typeof parsed === "object" && parsed.days && typeof parsed.days === "object") {
-      state.usage = { version: 1, days: parsed.days };
+      return parsed.days;
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
       console.error("[stats] usage.json 读取失败，按空统计启动:", (err as Error).message);
     }
   }
+  return null;
+}
+
+/** 加载用量统计；配置 MYSQL_URL 时优先从 MySQL 读取并在表为空时自动导入本地 usage.json。 */
+export async function loadUsage(): Promise<void> {
+  if (state.loaded) return;
+
+  if (isMysqlConfigured() && (await initMysql())) {
+    const days = await loadMysqlUsage();
+    if (Object.keys(days).length > 0) {
+      state.usage = { version: 1, days };
+    } else {
+      const localDays = await readLocalUsageFile();
+      if (localDays && Object.keys(localDays).length > 0) {
+        state.usage = { version: 1, days: localDays };
+        const entries: { day: string; dim: string; bucket: Bucket }[] = [];
+        for (const [day, dayMap] of Object.entries(localDays)) {
+          for (const [dim, bucket] of Object.entries(dayMap)) {
+            entries.push({ day, dim, bucket });
+          }
+        }
+        await upsertMysqlUsageBuckets(entries);
+        console.log("[stats] 已将本地 usage.json 导入 MySQL (usage_daily)");
+      }
+    }
+    state.loaded = true;
+    return;
+  }
+
+  const localDays = await readLocalUsageFile();
+  if (localDays) state.usage = { version: 1, days: localDays };
   state.loaded = true;
 }
 
@@ -74,6 +115,9 @@ function addTo(bucket: Bucket, line: RequestLogLine): void {
   if (line.status >= 400 || line.err) bucket.err += 1;
   bucket.pt += line.pt;
   bucket.ct += line.ct;
+  if (line.cachedPt && line.cachedPt > 0) {
+    bucket.cachedPt = (bucket.cachedPt ?? 0) + line.cachedPt;
+  }
   bucket.msSum += line.ms;
   if (line.ttftMs > 0) {
     bucket.ttftSum += line.ttftMs;
@@ -92,6 +136,32 @@ function scheduleFlush(): void {
 }
 
 export async function flushUsage(): Promise<void> {
+  if (isMysqlConfigured() && (await initMysql())) {
+    if (!state.dirty && state.dirtyKeys.size === 0) return;
+    const keys = [...state.dirtyKeys];
+    state.dirtyKeys.clear();
+    state.dirty = false;
+    if (keys.length === 0) return;
+
+    const entries: { day: string; dim: string; bucket: Bucket }[] = [];
+    for (const k of keys) {
+      const sep = k.indexOf("\u0000");
+      if (sep <= 0) continue;
+      const day = k.slice(0, sep);
+      const dim = k.slice(sep + 1);
+      const bucket = state.usage.days[day]?.[dim];
+      if (bucket) entries.push({ day, dim, bucket });
+    }
+    try {
+      await upsertMysqlUsageBuckets(entries);
+    } catch (err) {
+      for (const k of keys) state.dirtyKeys.add(k);
+      state.dirty = true;
+      console.error("[stats] MySQL 用量写入失败:", (err as Error).message);
+    }
+    return;
+  }
+
   if (!state.dirty) return;
   state.dirty = false;
   const snapshot = state.usage;
@@ -124,12 +194,16 @@ export async function flushLogs(): Promise<void> {
 }
 
 /** 记一条请求。同步更新内存，落盘异步。 */
-export function recordRequest(line: RequestLogLine): void {
+export function recordRequest(line: RequestLogLine, body?: TraceBodyInput | null): void {
+  line.id ??= generateLogId(line.ts);
+  if (body) line.hasBody = true;
+
   const day = localDateKey(new Date(line.ts));
-  addTo(bucketOf(day, "total"), line);
-  addTo(bucketOf(day, `upstream:${line.upId}`), line);
-  addTo(bucketOf(day, `key:${line.keyId}`), line);
-  addTo(bucketOf(day, `model:${line.model}`), line);
+  const dims = ["total", `upstream:${line.upId}`, `key:${line.keyId}`, `model:${line.model}`];
+  for (const dim of dims) {
+    addTo(bucketOf(day, dim), line);
+    state.dirtyKeys.add(`${day}\u0000${dim}`);
+  }
 
   const minute = Math.floor(line.ts / 60_000);
   let mb = state.recent.get(minute);
@@ -146,10 +220,14 @@ export function recordRequest(line: RequestLogLine): void {
     for (const k of keys.slice(0, keys.length - RECENT_MINUTES)) state.recent.delete(k);
   }
 
-  state.pendingLines.push(JSON.stringify(line) + "\n");
   scheduleFlush();
-  if (state.pendingLines.length >= 200) void flushLogs();
-  else scheduleLogFlush();
+  if (isMysqlConfigured()) {
+    enqueueMysqlLog(line, body);
+  } else {
+    state.pendingLines.push(JSON.stringify(line) + "\n");
+    if (state.pendingLines.length >= 200) void flushLogs();
+    else scheduleLogFlush();
+  }
 }
 
 /** 当日某维度已经用掉的量，用于下游 key 的日限额判断。 */
@@ -188,6 +266,7 @@ export interface Summary {
   err: number;
   pt: number;
   ct: number;
+  cachedPt: number;
   tokens: number;
   avgTtftMs: number;
   avgMs: number;
@@ -200,6 +279,7 @@ export function summarize(bucket?: Bucket): Summary {
     err: b.err,
     pt: b.pt,
     ct: b.ct,
+    cachedPt: b.cachedPt ?? 0,
     tokens: b.pt + b.ct,
     avgTtftMs: b.ttftN ? Math.round(b.ttftSum / b.ttftN) : 0,
     avgMs: b.req ? Math.round(b.msSum / b.req) : 0,
@@ -221,7 +301,10 @@ export function dayKeys(): string[] {
 const MAX_READ_BYTES = 4 * 1024 * 1024;
 
 /** 从最近几天的明细里取最新的若干条。 */
-export async function readLogs(limit = 200, filter?: { keyId?: string; upId?: string; status?: string }): Promise<RequestLogLine[]> {
+export async function readLogs(
+  limit = 200,
+  filter?: { keyId?: string; upId?: string; model?: string; status?: string },
+): Promise<RequestLogLine[]> {
   const out: RequestLogLine[] = [];
   let day = new Date();
   for (let i = 0; i < 3 && out.length < limit; i++) {
@@ -256,6 +339,7 @@ export async function readLogs(limit = 200, filter?: { keyId?: string; upId?: st
       }
       if (filter?.keyId && parsed.keyId !== filter.keyId) continue;
       if (filter?.upId && parsed.upId !== filter.upId) continue;
+      if (filter?.model && parsed.model !== filter.model) continue;
       if (filter?.status === "error" && !(parsed.status >= 400 || parsed.err)) continue;
       if (filter?.status === "ok" && (parsed.status >= 400 || parsed.err)) continue;
       out.push(parsed);

@@ -1,19 +1,20 @@
 "use client";
 
 import { useEffect } from "react";
-import { Activity, AlertTriangle, Coins, Timer } from "lucide-react";
+import { Activity, AlertTriangle, Coins, Timer, Wallet } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { TrafficChart, type TrafficPoint } from "@/components/traffic-chart";
 import { useResource, useNow } from "@/lib/client";
-import { countdown, errorRate, formatAfp, formatMs, formatNumber, formatReset, formatTime } from "@/lib/format";
+import { countdown, errorRate, formatAfp, formatCost, formatMs, formatNumber, formatReset, formatTime } from "@/lib/format";
 
 interface Summary {
   req: number;
   err: number;
   pt: number;
   ct: number;
+  cachedPt: number;
   tokens: number;
   avgTtftMs: number;
   avgMs: number;
@@ -68,11 +69,11 @@ interface KeyRow {
 }
 
 interface Overview {
-  totals: Summary;
+  totals: Summary & { cost: number; pricedModels: number };
   series: TrafficPoint[];
   upstreams: UpstreamRow[];
   keys: KeyRow[];
-  models: ({ model: string } & Summary)[];
+  models: ({ model: string; cost: number | null } & Summary)[];
   dataDir: string;
 }
 
@@ -249,17 +250,27 @@ export default function DashboardPage() {
       <div>
         <h1 className="font-heading text-xl font-semibold">仪表盘</h1>
         <p className="text-sm text-muted-foreground">
-          今日用量与上游健康度，每 15 秒自动刷新{data ? ` · 数据目录 ${data.dataDir}` : ""}
+          今日用量与上游健康度，每 15 秒自动刷新{data ? ` · 数据存储 ${data.dataDir}` : ""}
         </p>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
         <StatCard title="今日请求" value={formatNumber(totals?.req ?? 0)} icon={Activity} />
         <StatCard
           title="今日 Token"
           value={formatNumber(totals?.tokens ?? 0)}
-          hint={totals ? `输入 ${formatNumber(totals.pt)} / 输出 ${formatNumber(totals.ct)}` : undefined}
+          hint={
+            totals
+              ? `输入 ${formatNumber(totals.pt)}${totals.cachedPt > 0 ? `（含缓存 ${formatNumber(totals.cachedPt)}）` : ""} / 输出 ${formatNumber(totals.ct)}`
+              : undefined
+          }
           icon={Coins}
+        />
+        <StatCard
+          title="今日预估费用"
+          value={formatCost(totals?.cost ?? 0)}
+          hint={totals ? `已定价 ${totals.pricedModels} 个有流量模型` : undefined}
+          icon={Wallet}
         />
         <StatCard
           title="错误率"
@@ -404,13 +415,14 @@ export default function DashboardPage() {
                 <TableRow>
                   <TableHead className="pl-4">模型</TableHead>
                   <TableHead className="text-right">请求</TableHead>
-                  <TableHead className="pr-4 text-right">Token</TableHead>
+                  <TableHead className="text-right">Token</TableHead>
+                  <TableHead className="pr-4 text-right">预估费用</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {(data?.models ?? []).length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={3} className="py-6 text-center text-sm text-muted-foreground">
+                    <TableCell colSpan={4} className="py-6 text-center text-sm text-muted-foreground">
                       今天还没有流量
                     </TableCell>
                   </TableRow>
@@ -419,7 +431,16 @@ export default function DashboardPage() {
                     <TableRow key={row.model}>
                       <TableCell className="pl-4 font-mono text-xs">{row.model}</TableCell>
                       <TableCell className="text-right tabular-nums">{formatNumber(row.req)}</TableCell>
-                      <TableCell className="pr-4 text-right tabular-nums">{formatNumber(row.tokens)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{formatNumber(row.tokens)}</TableCell>
+                      <TableCell className="pr-4 text-right tabular-nums">
+                        {row.cost !== null ? (
+                          formatCost(row.cost)
+                        ) : (
+                          <a href="/models" className="text-xs text-muted-foreground underline-offset-4 hover:underline">
+                            未定价
+                          </a>
+                        )}
+                      </TableCell>
                     </TableRow>
                   ))
                 )}

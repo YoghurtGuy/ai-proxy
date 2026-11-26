@@ -26,10 +26,12 @@ type NumericKey =
   | "traffic.burstQueueMaxSize"
   | "traffic.slopeWindowSec"
   | "traffic.slopeMaxGrowthRatio"
-  | "traffic.slopeMinBaseline";
+  | "traffic.slopeMinBaseline"
+  | "trace.maxBodyKb";
 
 type Form = Record<NumericKey, string> & {
   "traffic.enabled": boolean;
+  "trace.enabled": boolean;
 };
 
 function toForm(settings: Settings): Form {
@@ -51,6 +53,8 @@ function toForm(settings: Settings): Form {
     "traffic.slopeWindowSec": String(settings.traffic.slopeWindowSec),
     "traffic.slopeMaxGrowthRatio": String(settings.traffic.slopeMaxGrowthRatio),
     "traffic.slopeMinBaseline": String(settings.traffic.slopeMinBaseline),
+    "trace.enabled": settings.trace.enabled,
+    "trace.maxBodyKb": String(settings.trace.maxBodyKb),
   };
 }
 
@@ -77,6 +81,10 @@ function payloadOf(form: Form): Settings {
       slopeWindowSec: n("traffic.slopeWindowSec"),
       slopeMaxGrowthRatio: n("traffic.slopeMaxGrowthRatio"),
       slopeMinBaseline: n("traffic.slopeMinBaseline"),
+    },
+    trace: {
+      enabled: form["trace.enabled"],
+      maxBodyKb: n("trace.maxBodyKb"),
     },
   };
 }
@@ -150,7 +158,9 @@ export default function SettingsPage() {
     <form onSubmit={save} className="flex flex-col gap-4">
       <div>
         <h1 className="font-heading text-xl font-semibold">设置</h1>
-        <p className="text-sm text-muted-foreground">写入 config.json，保存后立即对后续请求生效。</p>
+        <p className="text-sm text-muted-foreground">
+          保存后立即对后续请求生效（配置 MYSQL_URL 时写入 MySQL，否则写入 config.json）。
+        </p>
       </div>
 
       <Card>
@@ -274,6 +284,34 @@ export default function SettingsPage() {
             hint="上周期请求低于此值时不限流，防冷启动误杀"
             value={form["traffic.slopeMinBaseline"]}
             onChange={(v) => set("traffic.slopeMinBaseline", v)}
+          />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <CardTitle>请求正文记录（Debug）</CardTitle>
+              <CardDescription>仅在配置 MYSQL_URL 时生效，异步压缩存储输入与输出供请求日志详情查看</CardDescription>
+            </div>
+            <div className="flex items-center gap-2">
+              <Label htmlFor="trace-enabled">记录正文</Label>
+              <Switch
+                id="trace-enabled"
+                checked={form["trace.enabled"]}
+                onCheckedChange={(v) => set("trace.enabled", v)}
+              />
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="grid gap-4 sm:grid-cols-2">
+          <Field
+            id="trace-kb"
+            label="单条正文截断上限（KB）"
+            hint="输入与输出各自限制（4～2048 KB），超长自动截断，Base64 图片自动脱敏"
+            value={form["trace.maxBodyKb"]}
+            onChange={(v) => set("trace.maxBodyKb", v)}
           />
         </CardContent>
       </Card>

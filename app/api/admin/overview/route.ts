@@ -1,7 +1,9 @@
 import { adminHandler } from "@/lib/admin";
+import { isMysqlConfigured } from "@/lib/mysql";
 import { keyInflight, upstreamSnapshot } from "@/lib/scheduler";
 import { recentSeries, summarize, todayBuckets } from "@/lib/stats";
 import { DATA_DIR, getConfig } from "@/lib/store";
+import { calculateModelCost } from "@/lib/types";
 
 /** 仪表盘需要的所有数据一次给全，省得前端串行发一堆请求。 */
 export async function GET(): Promise<Response> {
@@ -46,19 +48,28 @@ export async function GET(): Promise<Response> {
       inflight: keyInflight(key.id),
     }));
 
-    const modelEntries = Object.entries(buckets)
+    const allModelEntries = Object.entries(buckets)
       .filter(([dim]) => dim.startsWith("model:"))
-      .map(([dim, bucket]) => ({ model: dim.slice("model:".length), ...summarize(bucket) }))
-      .sort((a, b) => b.req - a.req)
-      .slice(0, 20);
+      .map(([dim, bucket]) => {
+        const model = dim.slice("model:".length);
+        const s = summarize(bucket);
+        const pricing = config.modelPrices[model];
+        const cost = pricing ? calculateModelCost(s.pt, s.ct, s.cachedPt, pricing) : null;
+        return { model, ...s, cost };
+      });
+
+    const totalCost = allModelEntries.reduce((sum, m) => sum + (m.cost ?? 0), 0);
+    const pricedModels = allModelEntries.filter((m) => m.cost !== null).length;
+
+    const modelEntries = allModelEntries.sort((a, b) => b.req - a.req).slice(0, 20);
 
     return Response.json({
-      totals: summarize(buckets.total),
+      totals: { ...summarize(buckets.total), cost: totalCost, pricedModels },
       series: recentSeries(60),
       upstreams,
       keys,
       models: modelEntries,
-      dataDir: DATA_DIR,
+      dataDir: isMysqlConfigured() ? "MySQL" : DATA_DIR,
       settings: config.settings,
     });
   });

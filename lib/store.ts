@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { initMysql, isMysqlConfigured, loadMysqlConfig, saveMysqlConfig } from "./mysql";
 import { normalizeConfig, type Config } from "./types";
 
 /**
@@ -49,36 +50,58 @@ export async function flushWrites(): Promise<void> {
 }
 
 export function configPathLabel(): string {
-  return CONFIG_PATH;
+  return isMysqlConfigured() ? "MySQL (app_config)" : CONFIG_PATH;
 }
 
 export function lastConfigError(): string | null {
   return state.lastError;
 }
 
-/** 从磁盘读取配置。文件不存在时写入一份空配置。 */
-export async function loadConfig(): Promise<Config> {
-  await fs.mkdir(DATA_DIR, { recursive: true });
+async function readLocalConfigFile(): Promise<unknown | null> {
   let text: string | null = null;
   try {
     text = await fs.readFile(CONFIG_PATH, "utf8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    return null;
+  }
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    throw new Error(`config.json 不是合法 JSON: ${(err as Error).message}`);
+  }
+}
+
+/** 读取配置；配置 MYSQL_URL 时优先从 MySQL 读取并在首次启动时自动导入本地 config.json。 */
+export async function loadConfig(): Promise<Config> {
+  if (isMysqlConfigured() && (await initMysql())) {
+    const remote = await loadMysqlConfig();
+    if (remote !== null) {
+      const config = normalizeConfig(remote);
+      state.config = config;
+      state.lastError = null;
+      return config;
+    }
+    const local = await readLocalConfigFile();
+    const config = normalizeConfig(local ?? {});
+    await enqueue(() => saveMysqlConfig(config));
+    if (local !== null) {
+      console.log("[store] 已将本地 config.json 导入 MySQL (app_config)");
+    }
+    state.config = config;
+    state.lastError = null;
+    return config;
   }
 
-  if (text === null) {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  const parsed = await readLocalConfigFile();
+  if (parsed === null) {
     const fresh = normalizeConfig({});
     state.config = fresh;
     await enqueue(() => writeJsonAtomic(CONFIG_PATH, fresh));
     return fresh;
   }
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch (err) {
-    throw new Error(`config.json 不是合法 JSON: ${(err as Error).message}`);
-  }
   const config = normalizeConfig(parsed);
   state.config = config;
   state.lastError = null;
@@ -98,7 +121,7 @@ export async function reloadConfig(): Promise<Config> {
 
 /**
  * 修改配置：mutator 拿到当前内存副本，返回新配置。
- * 校验通过才写盘并替换内存，失败时内存保持不变。
+ * 校验通过才落盘/写库并替换内存，失败时内存保持不变。
  */
 export async function updateConfig(mutator: (draft: Config) => Config | void): Promise<Config> {
   const current = await getConfig();
@@ -106,7 +129,11 @@ export async function updateConfig(mutator: (draft: Config) => Config | void): P
   const result = mutator(draft) ?? draft;
   const normalized = normalizeConfig(result);
   state.config = normalized;
-  await enqueue(() => writeJsonAtomic(CONFIG_PATH, normalized));
+  if (isMysqlConfigured() && (await initMysql())) {
+    await enqueue(() => saveMysqlConfig(normalized));
+  } else {
+    await enqueue(() => writeJsonAtomic(CONFIG_PATH, normalized));
+  }
   return normalized;
 }
 

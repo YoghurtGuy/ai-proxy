@@ -60,6 +60,13 @@ export function countdown(until: number, now: number): string {
   return `${Math.ceil(mins / 60)}h`;
 }
 
+export function formatCost(cost: number): string {
+  if (!Number.isFinite(cost) || cost <= 0) return "¥0.00";
+  if (cost < 0.01) return `¥${cost.toFixed(4)}`;
+  if (cost < 1) return `¥${cost.toFixed(3)}`;
+  return `¥${cost.toFixed(2)}`;
+}
+
 export function maskKey(key: string): string {
   if (key.length <= 12) return key;
   return `${key.slice(0, 8)}…${key.slice(-4)}`;

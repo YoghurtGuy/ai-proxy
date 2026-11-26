@@ -1,7 +1,7 @@
 "use client";
 
 import { usePathname } from "next/navigation";
-import { FileClock, KeyRound, LayoutDashboard, LogOut, RefreshCw, Server, Settings } from "lucide-react";
+import { Boxes, FileClock, KeyRound, LayoutDashboard, LogOut, RefreshCw, Server, Settings } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,7 @@ import { cn } from "cn";
 const NAV = [
   { href: "/", label: "仪表盘", icon: LayoutDashboard },
   { href: "/upstreams", label: "上游", icon: Server },
+  { href: "/models", label: "模型列表", icon: Boxes },
   { href: "/keys", label: "下游 Key", icon: KeyRound },
   { href: "/logs", label: "请求日志", icon: FileClock },
   { href: "/settings", label: "设置", icon: Settings },

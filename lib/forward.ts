@@ -10,9 +10,10 @@ import {
   selectAndAcquire,
   waitForUpstreamSlot,
 } from "./scheduler";
+import { isMysqlConfigured, type TraceBodyInput } from "./mysql";
 import { recordRequest, usedToday } from "./stats";
 import { getConfig } from "./store";
-import { tapStream, usageFromJsonBody, type UsageTotals } from "./stream";
+import { prepareTraceBody, tapStream, usageFromJsonBody, type UsageTotals } from "./stream";
 import { modelAllowed, type Config, type DownstreamKey, type Settings, type Upstream } from "./types";
 
 /**
@@ -280,21 +281,42 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
     }
   };
 
-  const record = (upId: string, status: number, usage: UsageTotals, ttftMs: number, retries: number, err: string | null) => {
-    recordRequest({
-      ts: Date.now(),
-      keyId: key.id,
-      upId,
-      model,
-      status,
-      stream: streamRequested,
-      pt: usage.pt,
-      ct: usage.ct,
-      ttftMs,
-      ms: Date.now() - startedAt,
-      retries,
-      err,
-    });
+  const traceEnabled = settings.trace.enabled && isMysqlConfigured();
+  const maxBodyBytes = settings.trace.maxBodyKb * 1024;
+  const buildTrace = (respText: string, respTruncated = false): TraceBodyInput | null => {
+    if (!traceEnabled) return null;
+    const reqPrep = rawBody ? prepareTraceBody(rawBody, maxBodyBytes) : { text: "", truncated: false };
+    if (!reqPrep.text && !respText) return null;
+    return { req: reqPrep.text, resp: respText, truncated: reqPrep.truncated || respTruncated };
+  };
+
+  const record = (
+    upId: string,
+    status: number,
+    usage: UsageTotals,
+    ttftMs: number,
+    retries: number,
+    err: string | null,
+    traceBody?: TraceBodyInput | null,
+  ) => {
+    recordRequest(
+      {
+        ts: Date.now(),
+        keyId: key.id,
+        upId,
+        model,
+        status,
+        stream: streamRequested,
+        pt: usage.pt,
+        ct: usage.ct,
+        ...(usage.cachedPt ? { cachedPt: usage.cachedPt } : {}),
+        ttftMs,
+        ms: Date.now() - startedAt,
+        retries,
+        err,
+      },
+      traceBody,
+    );
   };
 
   let lastError = "";
@@ -378,19 +400,30 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
       releaseUpstream(up.id);
       releaseKeyOnce();
       if (okStatus < 400) markSuccess(up.id, Date.now() - startedAt);
-      record(up.id, okStatus, usage, 0, attempt, okStatus >= 400 ? text.slice(0, 200) : null);
+      const respPrep = traceEnabled ? prepareTraceBody(text, maxBodyBytes) : null;
+      record(
+        up.id,
+        okStatus,
+        usage,
+        0,
+        attempt,
+        okStatus >= 400 ? text.slice(0, 200) : null,
+        respPrep ? buildTrace(respPrep.text, respPrep.truncated) : null,
+      );
       return new Response(text, { status: okStatus, headers: headersOut });
     }
 
     let firstByteAt = 0;
     const tapped = tapStream(upstreamRes.body, {
+      captureMaxBytes: traceEnabled ? maxBodyBytes : 0,
       onFirstByte: () => {
         firstByteAt = Date.now();
       },
-      onDone: (usage, completed) => {
+      onDone: (usage, completed, captured) => {
         releaseUpstream(up.id);
         releaseKeyOnce();
         if (completed && okStatus < 400) markSuccess(up.id, Date.now() - startedAt);
+        const traceBody = traceEnabled ? buildTrace(captured ? JSON.stringify(captured) : "", Boolean(captured?.truncated)) : null;
         record(
           up.id,
           okStatus,
@@ -398,6 +431,7 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
           firstByteAt ? firstByteAt - startedAt : 0,
           attempt,
           completed ? null : "客户端提前断开",
+          traceBody,
         );
       },
     });
@@ -405,7 +439,16 @@ export async function handleProxy(req: Request, options: ProxyOptions): Promise<
   }
 
   releaseKeyOnce();
-  record(lastUpId, lastStatus, { pt: 0, ct: 0, exact: false }, 0, settings.maxAttempts, lastError);
+  const errPrep = traceEnabled && lastError ? prepareTraceBody(lastError, maxBodyBytes) : null;
+  record(
+    lastUpId,
+    lastStatus,
+    { pt: 0, ct: 0, exact: false },
+    0,
+    settings.maxAttempts,
+    lastError,
+    traceEnabled ? buildTrace(errPrep?.text ?? "", Boolean(errPrep?.truncated)) : null,
+  );
   if (slopeRetryAfterSec !== undefined) {
     return jsonError(429, lastError, "slope_limited", { "retry-after": String(slopeRetryAfterSec) });
   }

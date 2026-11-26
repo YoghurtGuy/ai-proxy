@@ -33,6 +33,13 @@ export interface TrafficSettings {
   slopeMinBaseline: number;
 }
 
+export interface TraceSettings {
+  /** 是否记录请求输入与模型输出正文（配置 MYSQL_URL 时落库） */
+  enabled: boolean;
+  /** 单条输入或输出正文最大保留大小（KB） */
+  maxBodyKb: number;
+}
+
 export interface Settings {
   /** 套餐额度轮询间隔（秒），0 关闭 */
   quotaPollSec: number;
@@ -48,6 +55,7 @@ export interface Settings {
   logRetentionDays: number;
   weights: WeightSettings;
   traffic: TrafficSettings;
+  trace: TraceSettings;
 }
 
 export type QuotaProvider = "volcengine-afp";
@@ -102,11 +110,21 @@ export interface DownstreamKey {
   limits: KeyLimits;
 }
 
+export interface ModelPricing {
+  /** 常规输入单价（元 / 百万 Token） */
+  inputPerM: number;
+  /** 缓存命中单价（元 / 百万 Token） */
+  cachedInputPerM: number;
+  /** 输出单价（元 / 百万 Token） */
+  outputPerM: number;
+}
+
 export interface Config {
   version: number;
   settings: Settings;
   upstreams: Upstream[];
   keys: DownstreamKey[];
+  modelPrices: Record<string, ModelPricing>;
 }
 
 /** 单个统计桶。ttftSum/ttftN 用于算首字延迟均值。 */
@@ -115,6 +133,7 @@ export interface Bucket {
   err: number;
   pt: number;
   ct: number;
+  cachedPt?: number;
   ttftSum: number;
   ttftN: number;
   msSum: number;
@@ -143,6 +162,7 @@ export interface QuotaSnapshot {
 }
 
 export interface RequestLogLine {
+  id?: string;
   ts: number;
   keyId: string;
   upId: string;
@@ -151,10 +171,12 @@ export interface RequestLogLine {
   stream: boolean;
   pt: number;
   ct: number;
+  cachedPt?: number;
   ttftMs: number;
   ms: number;
   retries: number;
   err: string | null;
+  hasBody?: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -173,6 +195,10 @@ export const DEFAULT_SETTINGS: Settings = {
     slopeMaxGrowthRatio: 0.5,
     slopeMinBaseline: 20,
   },
+  trace: {
+    enabled: true,
+    maxBodyKb: 128,
+  },
 };
 
 export const DEFAULT_KEY_LIMITS: KeyLimits = {
@@ -189,7 +215,15 @@ export function emptyBucket(): Bucket {
 }
 
 export function emptyConfig(): Config {
-  return { version: CONFIG_VERSION, settings: { ...DEFAULT_SETTINGS }, upstreams: [], keys: [] };
+  return { version: CONFIG_VERSION, settings: { ...DEFAULT_SETTINGS }, upstreams: [], keys: [], modelPrices: {} };
+}
+
+/** 按模型单价（元 / 百万 Token）计算费用；pt 包含 cachedPt 时会自动扣除缓存命中部分。 */
+export function calculateModelCost(pt: number, ct: number, cachedPt: number, pricing?: ModelPricing | null): number {
+  if (!pricing) return 0;
+  const cached = Math.max(0, Math.min(pt, cachedPt));
+  const uncachedInput = Math.max(0, pt - cached);
+  return (uncachedInput * pricing.inputPerM + cached * pricing.cachedInputPerM + ct * pricing.outputPerM) / 1_000_000;
 }
 
 /** 模型是否被允许（支持 "*" 通配）。 */
@@ -254,6 +288,7 @@ export function normalizeSettings(raw: unknown): Settings {
   const o = raw ? asObject(raw, "settings") : {};
   const w = o.weights ? asObject(o.weights, "settings.weights") : {};
   const t = o.traffic ? asObject(o.traffic, "settings.traffic") : {};
+  const tr = o.trace ? asObject(o.trace, "settings.trace") : {};
   const d = DEFAULT_SETTINGS;
   return {
     quotaPollSec: asNumber(o.quotaPollSec, "settings.quotaPollSec", d.quotaPollSec, 0, 86400),
@@ -290,6 +325,10 @@ export function normalizeSettings(raw: unknown): Settings {
       slopeMinBaseline: Math.round(
         asNumber(t.slopeMinBaseline, "settings.traffic.slopeMinBaseline", d.traffic.slopeMinBaseline, 1, 1_000_000),
       ),
+    },
+    trace: {
+      enabled: asBool(tr.enabled, "settings.trace.enabled", d.trace.enabled),
+      maxBodyKb: Math.round(asNumber(tr.maxBodyKb, "settings.trace.maxBodyKb", d.trace.maxBodyKb, 4, 2048)),
     },
   };
 }
@@ -354,6 +393,23 @@ export function normalizeKey(raw: unknown, index: number): DownstreamKey {
   };
 }
 
+export function normalizeModelPrices(raw: unknown): Record<string, ModelPricing> {
+  if (raw == null) return {};
+  const o = asObject(raw, "modelPrices");
+  const out: Record<string, ModelPricing> = {};
+  for (const [model, val] of Object.entries(o)) {
+    const key = model.trim();
+    if (!key) continue;
+    const item = asObject(val, `modelPrices.${key}`);
+    out[key] = {
+      inputPerM: asNumber(item.inputPerM, `modelPrices.${key}.inputPerM`, 0, 0, 1_000_000),
+      cachedInputPerM: asNumber(item.cachedInputPerM, `modelPrices.${key}.cachedInputPerM`, 0, 0, 1_000_000),
+      outputPerM: asNumber(item.outputPerM, `modelPrices.${key}.outputPerM`, 0, 0, 1_000_000),
+    };
+  }
+  return out;
+}
+
 export function normalizeConfig(raw: unknown): Config {
   const o = raw ? asObject(raw, "config") : {};
   const upstreams = o.upstreams == null ? [] : o.upstreams;
@@ -380,5 +436,6 @@ export function normalizeConfig(raw: unknown): Config {
     settings: normalizeSettings(o.settings),
     upstreams: parsedUpstreams,
     keys: parsedKeys,
+    modelPrices: normalizeModelPrices(o.modelPrices),
   };
 }

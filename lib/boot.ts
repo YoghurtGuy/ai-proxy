@@ -1,4 +1,5 @@
 import { fetchVolcengineQuota } from "./quota/volcengine";
+import { cleanupMysqlLogs, flushMysqlLogs, initMysql, isMysqlConfigured } from "./mysql";
 import { pruneRuntime, setQuota } from "./scheduler";
 import { cleanupOldLogs, flushLogs, flushUsage, loadUsage } from "./stats";
 import { DATA_DIR, flushWrites, getConfig, loadConfig } from "./store";
@@ -30,7 +31,9 @@ export async function bootstrap(): Promise<void> {
   const config = await loadConfig();
   pruneRuntime(config);
   await loadUsage();
+  const mysqlReady = await initMysql();
   const removed = await cleanupOldLogs(config.settings.logRetentionDays);
+  const removedMysql = mysqlReady ? await cleanupMysqlLogs(config.settings.logRetentionDays) : 0;
 
   void pollQuotas().catch((err) => console.error("[quota] 首次轮询失败:", (err as Error).message));
 
@@ -44,7 +47,10 @@ export async function bootstrap(): Promise<void> {
   const cleanupTimer = setInterval(
     () => {
       void getConfig()
-        .then((c) => cleanupOldLogs(c.settings.logRetentionDays))
+        .then(async (c) => {
+          await cleanupOldLogs(c.settings.logRetentionDays);
+          if (isMysqlConfigured()) await cleanupMysqlLogs(c.settings.logRetentionDays);
+        })
         .catch(() => undefined);
     },
     24 * 60 * 60 * 1000,
@@ -53,7 +59,7 @@ export async function bootstrap(): Promise<void> {
 
   console.log(
     `[ai-proxy] 配置加载完成：${config.upstreams.length} 个上游 / ${config.keys.length} 个下游 key` +
-      `，数据目录 ${DATA_DIR}${removed ? `，清理了 ${removed} 个过期日志` : ""}`,
+      `，${mysqlReady ? "存储 MySQL" : `数据目录 ${DATA_DIR}`}${removed + removedMysql ? `，清理了 ${removed + removedMysql} 条过期日志` : ""}`,
   );
   if (!config.upstreams.some((u) => u.quota?.accessKey)) {
     console.log("[ai-proxy] 没有上游配置套餐额度查询，按量计费上游不需要额度轮询");
@@ -64,6 +70,7 @@ export async function bootstrap(): Promise<void> {
 
   const shutdown = () => {
     void (async () => {
+      await flushMysqlLogs();
       await flushLogs();
       await flushUsage();
       await flushWrites();

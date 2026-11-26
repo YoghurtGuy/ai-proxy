@@ -30,12 +30,20 @@ export async function GET(req: Request): Promise<Response> {
 
   const enabled = config.upstreams.filter((up) => up.enabled);
   const resolved = await Promise.all(
-    enabled.map(async (up) => ({ up, result: await listUpstreamModels(up) })),
+    enabled.map(async (up) => {
+      if (!up.models.includes("*")) {
+        return up.models;
+      }
+      const result = await listUpstreamModels(up);
+      return result.models;
+    }),
   );
 
   const modelIds = new Set<string>();
-  for (const { result } of resolved) {
-    for (const id of result.models) modelIds.add(id);
+  for (const models of resolved) {
+    for (const id of models) {
+      if (id && id !== "*") modelIds.add(id);
+    }
   }
 
   const data = [...modelIds]

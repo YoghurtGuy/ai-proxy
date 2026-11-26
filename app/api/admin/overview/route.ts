@@ -1,15 +1,15 @@
 import { adminHandler } from "@/lib/admin";
 import { isMysqlConfigured } from "@/lib/mysql";
 import { keyInflight, upstreamSnapshot } from "@/lib/scheduler";
-import { recentSeries, summarize, todayBuckets } from "@/lib/stats";
+import { getTodayBuckets, recentSeries, summarize } from "@/lib/stats";
 import { DATA_DIR, getConfig } from "@/lib/store";
-import { calculateModelCost } from "@/lib/types";
+import { calculateModelCost, canonicalModelName, findModelPricing, mergeBuckets, type Bucket } from "@/lib/types";
 
 /** 仪表盘需要的所有数据一次给全，省得前端串行发一堆请求。 */
 export async function GET(): Promise<Response> {
   return adminHandler(async () => {
     const config = await getConfig();
-    const buckets = todayBuckets();
+    const buckets = await getTodayBuckets();
     const runtime = upstreamSnapshot();
 
     const upstreams = config.upstreams.map((up) => {
@@ -48,15 +48,22 @@ export async function GET(): Promise<Response> {
       inflight: keyInflight(key.id),
     }));
 
-    const allModelEntries = Object.entries(buckets)
-      .filter(([dim]) => dim.startsWith("model:"))
-      .map(([dim, bucket]) => {
-        const model = dim.slice("model:".length);
-        const s = summarize(bucket);
-        const pricing = config.modelPrices[model];
-        const cost = pricing ? calculateModelCost(s.pt, s.ct, s.cachedPt, pricing) : null;
-        return { model, ...s, cost };
-      });
+    const mergedModels = new Map<string, Bucket>();
+    for (const [dim, bucket] of Object.entries(buckets)) {
+      if (!dim.startsWith("model:")) continue;
+      const rawModel = dim.slice("model:".length).trim();
+      if (!rawModel) continue;
+      const canonical = canonicalModelName(rawModel);
+      const prev = mergedModels.get(canonical);
+      mergedModels.set(canonical, prev ? mergeBuckets(prev, bucket) : bucket);
+    }
+
+    const allModelEntries = [...mergedModels.entries()].map(([model, bucket]) => {
+      const s = summarize(bucket);
+      const pricing = findModelPricing(config.modelPrices, model);
+      const cost = pricing ? calculateModelCost(s.pt, s.ct, s.cachedPt, pricing) : null;
+      return { model, ...s, cost };
+    });
 
     const totalCost = allModelEntries.reduce((sum, m) => sum + (m.cost ?? 0), 0);
     const pricedModels = allModelEntries.filter((m) => m.cost !== null).length;

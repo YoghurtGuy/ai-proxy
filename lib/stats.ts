@@ -6,6 +6,7 @@ import {
   initMysql,
   isMysqlConfigured,
   loadMysqlUsage,
+  loadMysqlUsageForDay,
   upsertMysqlUsageBuckets,
   type TraceBodyInput,
 } from "./mysql";
@@ -258,6 +259,19 @@ export function recentSeries(minutes = 60, now = Date.now()): RecentPoint[] {
 
 export function todayBuckets(): Record<string, Bucket> {
   return state.usage.days[localDateKey()] ?? {};
+}
+
+/** 异步获取当日最新统计桶：先加载或刷新本进程脏桶，再从 MySQL 同步当日最新汇总（多 worker 安全）。 */
+export async function getTodayBuckets(): Promise<Record<string, Bucket>> {
+  await loadUsage();
+  const day = localDateKey();
+  if (isMysqlConfigured() && (await initMysql())) {
+    await flushUsage();
+    const dayMap = await loadMysqlUsageForDay(day);
+    state.usage.days[day] = dayMap;
+    return dayMap;
+  }
+  return state.usage.days[day] ?? {};
 }
 
 /** 把累加桶换算成展示用的指标（含均值）。 */

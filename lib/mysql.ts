@@ -227,6 +227,20 @@ interface UsageRow extends RowDataPacket {
   ms_sum: number | string;
 }
 
+function usageRowToBucket(r: UsageRow): Bucket {
+  const cachedPt = Number(r.cached_pt) || 0;
+  return {
+    req: Number(r.req) || 0,
+    err: Number(r.err) || 0,
+    pt: Number(r.pt) || 0,
+    ct: Number(r.ct) || 0,
+    ...(cachedPt > 0 ? { cachedPt } : {}),
+    ttftSum: Number(r.ttft_sum) || 0,
+    ttftN: Number(r.ttft_n) || 0,
+    msSum: Number(r.ms_sum) || 0,
+  };
+}
+
 export async function loadMysqlUsage(): Promise<Record<string, Record<string, Bucket>>> {
   const ok = await initMysql();
   if (!ok || !state.pool) throw new Error("MySQL 未就绪");
@@ -236,19 +250,23 @@ export async function loadMysqlUsage(): Promise<Record<string, Record<string, Bu
   const days: Record<string, Record<string, Bucket>> = {};
   for (const r of rows) {
     const dayMap = (days[r.day] ??= {});
-    const cachedPt = Number(r.cached_pt) || 0;
-    dayMap[r.dim] = {
-      req: Number(r.req) || 0,
-      err: Number(r.err) || 0,
-      pt: Number(r.pt) || 0,
-      ct: Number(r.ct) || 0,
-      ...(cachedPt > 0 ? { cachedPt } : {}),
-      ttftSum: Number(r.ttft_sum) || 0,
-      ttftN: Number(r.ttft_n) || 0,
-      msSum: Number(r.ms_sum) || 0,
-    };
+    dayMap[r.dim] = usageRowToBucket(r);
   }
   return days;
+}
+
+export async function loadMysqlUsageForDay(day: string): Promise<Record<string, Bucket>> {
+  const ok = await initMysql();
+  if (!ok || !state.pool) throw new Error("MySQL 未就绪");
+  const [rows] = await state.pool.query<UsageRow[]>(
+    "SELECT day, dim, req, err, pt, ct, cached_pt, ttft_sum, ttft_n, ms_sum FROM usage_daily WHERE day = ?",
+    [day],
+  );
+  const dayMap: Record<string, Bucket> = {};
+  for (const r of rows) {
+    dayMap[r.dim] = usageRowToBucket(r);
+  }
+  return dayMap;
 }
 
 export async function upsertMysqlUsageBuckets(

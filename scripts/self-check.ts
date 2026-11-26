@@ -21,7 +21,13 @@ import {
   upState,
   waitForUpstreamSlot,
 } from "../lib/scheduler";
-import { calculateModelCost, normalizeConfig } from "../lib/types";
+import {
+  calculateModelCost,
+  canonicalModelName,
+  findModelPricing,
+  mergeBuckets,
+  normalizeConfig,
+} from "../lib/types";
 import { formatCost } from "../lib/format";
 import { authHint } from "../lib/hints";
 import { signRequest, fetchVolcengineQuota, listAgentPlanModels } from "../lib/quota/volcengine";
@@ -724,6 +730,40 @@ check("generateLogId 生成 26 位按时间单调有序 ID", () => {
   assert.equal(a.length, 26);
   assert.equal(b.length, 26);
   assert.ok(a.slice(0, 12) < b.slice(0, 12));
+});
+
+check("canonicalModelName 与 findModelPricing 归并 -六位数字 后缀", () => {
+  assert.equal(canonicalModelName("doubao-seed-2-1-lite-260915"), "doubao-seed-2-1-lite");
+  assert.equal(canonicalModelName("doubao-seed-2.1-lite"), "doubao-seed-2.1-lite");
+  assert.equal(canonicalModelName("glm-5.3"), "glm-5.3");
+
+  const cfg = normalizeConfig({
+    modelPrices: {
+      "doubao-seed-2-1-lite-260915": { inputPerM: 1, cachedInputPerM: 0.2, outputPerM: 3 },
+      "doubao-seed-2-1-lite": { inputPerM: 0.8, cachedInputPerM: 0.16, outputPerM: 2.7 },
+    },
+  });
+  // 优先保留精确前缀定价
+  assert.deepEqual(Object.keys(cfg.modelPrices), ["doubao-seed-2-1-lite"]);
+  assert.equal(findModelPricing(cfg.modelPrices, "doubao-seed-2-1-lite-260915")?.inputPerM, 0.8);
+  assert.equal(findModelPricing(cfg.modelPrices, "doubao-seed-2-1-lite")?.outputPerM, 2.7);
+});
+
+check("mergeBuckets 正确累加用量与缓存命中", () => {
+  const merged = mergeBuckets(
+    { req: 2, err: 0, pt: 100, ct: 50, cachedPt: 40, ttftSum: 200, ttftN: 2, msSum: 500 },
+    { req: 3, err: 1, pt: 300, ct: 150, ttftSum: 300, ttftN: 1, msSum: 700 },
+  );
+  assert.deepEqual(merged, {
+    req: 5,
+    err: 1,
+    pt: 400,
+    ct: 200,
+    cachedPt: 40,
+    ttftSum: 500,
+    ttftN: 3,
+    msSum: 1200,
+  });
 });
 
 console.log(`\n${passed} 项通过${process.exitCode ? "，有失败" : ""}`);

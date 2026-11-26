@@ -18,8 +18,10 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useResource } from "@/lib/client";
-import { formatMs, formatNumber, formatTime } from "@/lib/format";
+import { formatCost, formatMs, formatNumber, formatTime } from "@/lib/format";
 import type { RequestLogLine } from "@/lib/types";
+
+type LogRow = RequestLogLine & { cost?: number | null };
 
 interface LogDetail {
   log: RequestLogLine;
@@ -188,11 +190,11 @@ function prettyJson(raw: string | null): string {
 export default function LogsPage() {
   const [limit, setLimit] = useState("200");
   const [status, setStatus] = useState("all");
-  const [keyId, setKeyId] = useState("");
-  const [upId, setUpId] = useState("");
+  const [keyId, setKeyId] = useState("all");
+  const [upId, setUpId] = useState("all");
   const [model, setModel] = useState("");
 
-  const [selected, setSelected] = useState<RequestLogLine | null>(null);
+  const [selected, setSelected] = useState<LogRow | null>(null);
   const [detail, setDetail] = useState<LogDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
@@ -201,15 +203,23 @@ export default function LogsPage() {
 
   const params = new URLSearchParams({ limit });
   if (status !== "all") params.set("status", status);
-  if (keyId.trim()) params.set("keyId", keyId.trim());
-  if (upId.trim()) params.set("upId", upId.trim());
+  if (keyId !== "all") params.set("keyId", keyId);
+  if (upId !== "all") params.set("upId", upId);
   if (model.trim()) params.set("model", model.trim());
 
-  const { data, error, loading } = useResource<{ logs: RequestLogLine[]; mysqlEnabled?: boolean }>(
-    `/api/admin/logs?${params.toString()}`,
-  );
+  const { data, error, loading } = useResource<{
+    logs: LogRow[];
+    mysqlEnabled?: boolean;
+    upstreams?: { id: string; name: string }[];
+    keys?: { id: string; name: string }[];
+  }>(`/api/admin/logs?${params.toString()}`);
 
-  const openDetail = async (log: RequestLogLine) => {
+  const upstreamMap = new Map((data?.upstreams ?? []).map((u) => [u.id, u.name]));
+  const keyMap = new Map((data?.keys ?? []).map((k) => [k.id, k.name]));
+  const upstreamName = (id: string) => (id ? (upstreamMap.get(id) ?? id) : "—");
+  const keyName = (id: string) => (id ? (keyMap.get(id) ?? id) : "—");
+
+  const openDetail = async (log: LogRow) => {
     if (!log.id) return;
     setSelected(log);
     setDetail(null);
@@ -267,13 +277,37 @@ export default function LogsPage() {
           <Label htmlFor="log-model">模型</Label>
           <Input id="log-model" value={model} onChange={(e) => setModel(e.target.value)} placeholder="精确模型名" />
         </div>
-        <div className="flex w-36 flex-col gap-1.5">
-          <Label htmlFor="log-key">下游 key id</Label>
-          <Input id="log-key" value={keyId} onChange={(e) => setKeyId(e.target.value)} placeholder="k_xxx" />
+        <div className="flex w-40 flex-col gap-1.5">
+          <Label htmlFor="log-key">下游 Key</Label>
+          <Select value={keyId} onValueChange={(v) => setKeyId(String(v))}>
+            <SelectTrigger id="log-key" className="w-full">
+              <SelectValue>{keyId === "all" ? "全部" : keyName(keyId)}</SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部</SelectItem>
+              {(data?.keys ?? []).map((k) => (
+                <SelectItem key={k.id} value={k.id}>
+                  {k.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
-        <div className="flex w-36 flex-col gap-1.5">
-          <Label htmlFor="log-up">上游 id</Label>
-          <Input id="log-up" value={upId} onChange={(e) => setUpId(e.target.value)} placeholder="u_xxx" />
+        <div className="flex w-40 flex-col gap-1.5">
+          <Label htmlFor="log-up">上游</Label>
+          <Select value={upId} onValueChange={(v) => setUpId(String(v))}>
+            <SelectTrigger id="log-up" className="w-full">
+              <SelectValue>{upId === "all" ? "全部" : upstreamName(upId)}</SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部</SelectItem>
+              {(data?.upstreams ?? []).map((u) => (
+                <SelectItem key={u.id} value={u.id}>
+                  {u.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
       </div>
 
@@ -296,6 +330,7 @@ export default function LogsPage() {
                 <TableHead>状态</TableHead>
                 <TableHead className="text-right">输入</TableHead>
                 <TableHead className="text-right">输出</TableHead>
+                <TableHead className="text-right">费用</TableHead>
                 <TableHead className="text-right">首字</TableHead>
                 <TableHead className="text-right">耗时</TableHead>
                 <TableHead className="text-right">重试</TableHead>
@@ -305,7 +340,7 @@ export default function LogsPage() {
             <TableBody>
               {(data?.logs ?? []).length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={9} className="py-8 text-center text-sm text-muted-foreground">
+                  <TableCell colSpan={10} className="py-8 text-center text-sm text-muted-foreground">
                     {loading ? "加载中…" : "没有匹配的请求"}
                   </TableCell>
                 </TableRow>
@@ -325,8 +360,11 @@ export default function LogsPage() {
                       <TableCell>
                         <div className="flex flex-col">
                           <span className="font-mono text-xs">{log.model || "—"}</span>
-                          <span className="text-[11px] text-muted-foreground">
-                            {log.upId || "—"} · {log.keyId}
+                          <span
+                            className="text-[11px] text-muted-foreground"
+                            title={`${log.upId || "—"} · ${log.keyId}`}
+                          >
+                            {upstreamName(log.upId)} · {keyName(log.keyId)}
                           </span>
                         </div>
                       </TableCell>
@@ -348,6 +386,15 @@ export default function LogsPage() {
                         ) : null}
                       </TableCell>
                       <TableCell className="text-right text-xs tabular-nums">{formatNumber(log.ct)}</TableCell>
+                      <TableCell className="text-right text-xs tabular-nums">
+                        {log.cost != null ? (
+                          <span className={log.pt === 0 && log.ct === 0 ? "text-muted-foreground" : undefined}>
+                            {formatCost(log.cost)}
+                          </span>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
+                      </TableCell>
                       <TableCell className="text-right text-xs tabular-nums">{formatMs(log.ttftMs)}</TableCell>
                       <TableCell className="text-right text-xs tabular-nums">{formatMs(log.ms)}</TableCell>
                       <TableCell className="text-right text-xs tabular-nums text-muted-foreground">
@@ -394,10 +441,11 @@ export default function LogsPage() {
             </DialogTitle>
             {selected ? (
               <DialogDescription className="text-xs tabular-nums">
-                {formatTime(selected.ts)} · 上游 {selected.upId || "—"} · Key {selected.keyId} · 输入{" "}
+                {formatTime(selected.ts)} · 上游 {upstreamName(selected.upId)} · Key {keyName(selected.keyId)} · 输入{" "}
                 {formatNumber(selected.pt)}
                 {selected.cachedPt ? `（缓存 ${formatNumber(selected.cachedPt)}）` : ""} / 输出{" "}
-                {formatNumber(selected.ct)} · 首字 {formatMs(selected.ttftMs)} / 耗时 {formatMs(selected.ms)}
+                {formatNumber(selected.ct)}
+                {selected.cost != null ? ` · 费用 ${formatCost(selected.cost)}` : ""} · 首字 {formatMs(selected.ttftMs)} / 耗时 {formatMs(selected.ms)}
               </DialogDescription>
             ) : null}
           </DialogHeader>

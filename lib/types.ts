@@ -229,6 +229,38 @@ export function calculateModelCost(pt: number, ct: number, cachedPt: number, pri
   return (uncachedInput * pricing.inputPerM + cached * pricing.cachedInputPerM + ct * pricing.outputPerM) / 1_000_000;
 }
 
+/** 将以 "-六位数字" 结尾的版本模型归并到其前缀，例如 doubao-seed-2-1-lite-260915 -> doubao-seed-2-1-lite */
+export function canonicalModelName(model: string): string {
+  return model.trim().replace(/-\d{6}$/, "");
+}
+
+/** 按精确名或归并前缀查找模型定价 */
+export function findModelPricing(
+  modelPrices: Record<string, ModelPricing>,
+  model: string,
+): ModelPricing | null {
+  const trimmed = model.trim();
+  if (!trimmed) return null;
+  if (modelPrices[trimmed]) return modelPrices[trimmed];
+  const canonical = canonicalModelName(trimmed);
+  return modelPrices[canonical] ?? null;
+}
+
+/** 合并多个 Bucket（用于归并同前缀版本模型的用量统计） */
+export function mergeBuckets(a: Bucket, b: Bucket): Bucket {
+  const cachedPt = (a.cachedPt ?? 0) + (b.cachedPt ?? 0);
+  return {
+    req: a.req + b.req,
+    err: a.err + b.err,
+    pt: a.pt + b.pt,
+    ct: a.ct + b.ct,
+    ...(cachedPt > 0 ? { cachedPt } : {}),
+    ttftSum: a.ttftSum + b.ttftSum,
+    ttftN: a.ttftN + b.ttftN,
+    msSum: a.msSum + b.msSum,
+  };
+}
+
 /** 模型是否被允许（支持 "*" 通配）。 */
 export function modelAllowed(allowed: string[], model: string): boolean {
   if (allowed.includes("*")) return true;
@@ -405,11 +437,15 @@ export function normalizeModelPrices(raw: unknown): Record<string, ModelPricing>
     const key = model.trim();
     if (!key) continue;
     const item = asObject(val, `modelPrices.${key}`);
-    out[key] = {
+    const canonical = canonicalModelName(key);
+    const parsed: ModelPricing = {
       inputPerM: asNumber(item.inputPerM, `modelPrices.${key}.inputPerM`, 0, 0, 1_000_000),
       cachedInputPerM: asNumber(item.cachedInputPerM, `modelPrices.${key}.cachedInputPerM`, 0, 0, 1_000_000),
       outputPerM: asNumber(item.outputPerM, `modelPrices.${key}.outputPerM`, 0, 0, 1_000_000),
     };
+    if (!out[canonical] || key === canonical) {
+      out[canonical] = parsed;
+    }
   }
   return out;
 }

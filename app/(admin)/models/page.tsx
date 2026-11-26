@@ -23,6 +23,7 @@ import type { ModelPricing } from "@/lib/types";
 
 interface ModelRow {
   id: string;
+  aliases?: string[];
   upstreams: { id: string; name: string }[];
   pricing: ModelPricing | null;
   today: {
@@ -203,7 +204,19 @@ export default function ModelsPage() {
               ) : (
                 filtered.map((row) => (
                   <TableRow key={row.id}>
-                    <TableCell className="pl-4 font-mono text-xs">{row.id}</TableCell>
+                    <TableCell className="max-w-[240px] pl-4">
+                      <div className="truncate font-mono text-xs" title={row.id}>
+                        {row.id}
+                      </div>
+                      {row.aliases && row.aliases.length > 0 ? (
+                        <div
+                          className="truncate text-[11px] text-muted-foreground"
+                          title={`已合并：${row.aliases.join("、")}`}
+                        >
+                          含 {row.aliases.join("、")}
+                        </div>
+                      ) : null}
+                    </TableCell>
                     <TableCell>
                       <div className="flex flex-wrap gap-1">
                         {row.upstreams.length === 0 ? (
@@ -239,7 +252,13 @@ export default function ModelsPage() {
                       )}
                     </TableCell>
                     <TableCell className="text-right tabular-nums text-sm font-medium">
-                      {row.today.cost !== null ? formatCost(row.today.cost) : <span className="text-muted-foreground">未定价</span>}
+                      {row.today.cost !== null ? (
+                        <span className={row.today.req === 0 ? "font-normal text-muted-foreground" : undefined}>
+                          {formatCost(row.today.cost)}
+                        </span>
+                      ) : (
+                        <span className="text-muted-foreground">未定价</span>
+                      )}
                     </TableCell>
                     <TableCell className="pr-4 text-right">
                       <div className="flex justify-end gap-1">

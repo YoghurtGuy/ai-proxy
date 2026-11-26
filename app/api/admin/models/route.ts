@@ -1,44 +1,59 @@
 import { adminHandler, readJson } from "@/lib/admin";
 import { listUpstreamModels } from "@/lib/models";
-import { summarize, todayBuckets } from "@/lib/stats";
+import { getTodayBuckets, summarize } from "@/lib/stats";
 import { getConfig, updateConfig } from "@/lib/store";
-import { calculateModelCost, normalizeModelPrices } from "@/lib/types";
+import {
+  calculateModelCost,
+  canonicalModelName,
+  findModelPricing,
+  mergeBuckets,
+  normalizeModelPrices,
+  type Bucket,
+} from "@/lib/types";
 
 export async function GET(req: Request): Promise<Response> {
   return adminHandler(async () => {
     const url = new URL(req.url);
     const refresh = url.searchParams.get("refresh") === "1";
     const config = await getConfig();
-    const buckets = todayBuckets();
+    const buckets = await getTodayBuckets();
 
+    const enabledUpstreams = config.upstreams.filter((u) => u.enabled);
     const resolved = await Promise.all(
-      config.upstreams
-        .filter((u) => u.enabled)
-        .map(async (u) => ({
-          up: u,
-          res: await listUpstreamModels(u, { refresh }),
-        })),
+      enabledUpstreams.map(async (u) => {
+        if (!u.models.includes("*")) {
+          return { up: u, models: u.models };
+        }
+        const res = await listUpstreamModels(u, { refresh });
+        return { up: u, models: res.models };
+      }),
     );
 
     const map = new Map<
       string,
       {
         id: string;
+        aliases: string[];
         upstreams: { id: string; name: string }[];
       }
     >();
 
-    const ensure = (id: string) => {
+    const ensure = (rawName: string) => {
+      const id = canonicalModelName(rawName);
       let entry = map.get(id);
       if (!entry) {
-        entry = { id, upstreams: [] };
+        entry = { id, aliases: [], upstreams: [] };
         map.set(id, entry);
+      }
+      const trimmed = rawName.trim();
+      if (trimmed && trimmed !== id && !entry.aliases.includes(trimmed)) {
+        entry.aliases.push(trimmed);
       }
       return entry;
     };
 
-    for (const { up, res } of resolved) {
-      for (const m of res.models) {
+    for (const { up, models } of resolved) {
+      for (const m of models) {
         if (!m || m === "*") continue;
         const entry = ensure(m);
         if (!entry.upstreams.some((x) => x.id === up.id)) {
@@ -51,16 +66,20 @@ export async function GET(req: Request): Promise<Response> {
       ensure(m);
     }
 
-    for (const dim of Object.keys(buckets)) {
+    const mergedBuckets = new Map<string, Bucket>();
+    for (const [dim, bucket] of Object.entries(buckets)) {
       if (!dim.startsWith("model:")) continue;
-      const m = dim.slice("model:".length);
-      if (m) ensure(m);
+      const rawModel = dim.slice("model:".length).trim();
+      if (!rawModel) continue;
+      const entry = ensure(rawModel);
+      const prev = mergedBuckets.get(entry.id);
+      mergedBuckets.set(entry.id, prev ? mergeBuckets(prev, bucket) : bucket);
     }
 
     const models = [...map.values()]
       .map((item) => {
-        const pricing = config.modelPrices[item.id] ?? null;
-        const summary = summarize(buckets[`model:${item.id}`]);
+        const pricing = findModelPricing(config.modelPrices, item.id);
+        const summary = summarize(mergedBuckets.get(item.id));
         const cost = pricing ? calculateModelCost(summary.pt, summary.ct, summary.cachedPt, pricing) : null;
         return {
           ...item,
@@ -81,27 +100,32 @@ export async function GET(req: Request): Promise<Response> {
 export async function PUT(req: Request): Promise<Response> {
   return adminHandler(async () => {
     const body = (await readJson(req)) as Record<string, unknown>;
-    const model = typeof body.model === "string" ? body.model.trim() : "";
-    if (!model) return Response.json({ error: "model 不能为空" }, { status: 400 });
+    const rawModel = typeof body.model === "string" ? body.model.trim() : "";
+    if (!rawModel) return Response.json({ error: "model 不能为空" }, { status: 400 });
 
+    const canonical = canonicalModelName(rawModel);
     const remove = body.remove === true;
     const config = await updateConfig((c) => {
+      const next = { ...c.modelPrices };
+      for (const existingKey of Object.keys(next)) {
+        if (canonicalModelName(existingKey) === canonical) {
+          delete next[existingKey];
+        }
+      }
       if (remove) {
-        const next = { ...c.modelPrices };
-        delete next[model];
         c.modelPrices = next;
         return;
       }
       const parsed = normalizeModelPrices({
-        [model]: {
+        [canonical]: {
           inputPerM: body.inputPerM,
           cachedInputPerM: body.cachedInputPerM,
           outputPerM: body.outputPerM,
         },
       });
-      c.modelPrices = { ...c.modelPrices, ...parsed };
+      c.modelPrices = { ...next, ...parsed };
     });
 
-    return Response.json({ ok: true, pricing: config.modelPrices[model] ?? null });
+    return Response.json({ ok: true, model: canonical, pricing: config.modelPrices[canonical] ?? null });
   });
 }
